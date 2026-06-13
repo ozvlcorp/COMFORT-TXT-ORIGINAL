@@ -1,0 +1,17 @@
+services:
+  bot:
+    build:
+      context: "./OY - Comfort bot"
+    restart: unless-stopped
+    env_file: .env
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    ports:
+      - "8080:8080"
+    volumes:
+      - bot_data:/data
+      - ./assets:/app/assets
+
+volumes:
+  bot_data:
