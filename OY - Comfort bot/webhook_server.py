@@ -11,14 +11,16 @@ aiohttp server that receives MoySklad webhooks and dispatches Telegram notificat
 """
 
 import logging
+import os
 import asyncio
 from html import escape
+import aiosqlite
 from aiohttp import web
 from aiogram.types import BufferedInputFile
 
 import database as db
 import moysklad_api as ms
-from config import WEBHOOK_PATH, WEBHOOK_SECRET, WEBHOOK_WORKERS
+from config import WEBHOOK_PATH, WEBHOOK_SECRET, WEBHOOK_WORKERS, DB_PATH
 from pdf_generator import generate_shipment_pdf
 from formatting import doc_number_for_template, fmt_datetime_display, fmt_quantity, fmt_usd
 
@@ -33,6 +35,7 @@ def setup(app: web.Application, bot) -> None:
     global _bot
     _bot = bot
     app.router.add_post(WEBHOOK_PATH, handle_moysklad_webhook)
+    app.router.add_post("/api/send-debt-reminder", handle_send_debt_reminder)
     app.cleanup_ctx.append(_webhook_worker_context)
 
 
@@ -130,6 +133,60 @@ async def handle_moysklad_webhook(request: web.Request) -> web.Response:
                 logger.exception("Webhook inline error [%s %s]: %s", entity_type, action, exc)
 
     return web.Response(text="accepted")
+
+
+async def handle_send_debt_reminder(request: web.Request) -> web.Response:
+    """Внешний эндпоинт для дашборда: отправить должнику сообщение через бота.
+
+    Контракт (совпадает с дашбордом ctdashboard.oymoysklad.com):
+        POST /api/send-debt-reminder
+        header: x-api-key: <DASHBOARD_API_KEY>
+        body:   {"counterpartyId": "<uuid>", "message": "<готовый текст>"}
+    """
+    api_key = os.getenv("DASHBOARD_API_KEY", "")
+    provided = request.headers.get("x-api-key", "")
+    if not api_key or provided != api_key:
+        logger.warning("send-debt-reminder: invalid x-api-key from %s", request.remote)
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+
+    counterparty_id = (payload.get("counterpartyId") or "").strip()
+    message = payload.get("message") or ""
+    if not counterparty_id or not message:
+        return web.json_response(
+            {"ok": False, "error": "counterpartyId_and_message_required"}, status=400
+        )
+
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT telegram_id FROM users WHERE moysklad_counterparty_id = ?",
+            (counterparty_id,),
+        ) as cur:
+            row = await cur.fetchone()
+    telegram_id = row["telegram_id"] if row else None
+
+    if telegram_id is None:
+        logger.info("send-debt-reminder: no TG user for counterparty %s", counterparty_id)
+        return web.json_response({"ok": False, "error": "no_telegram_user"}, status=404)
+
+    if _bot is None:
+        return web.json_response({"ok": False, "error": "bot_not_ready"}, status=503)
+
+    try:
+        await _bot.send_message(telegram_id, message)
+    except Exception as exc:
+        logger.exception(
+            "send-debt-reminder: send failed for user %s: %s", telegram_id, exc
+        )
+        return web.json_response({"ok": False, "error": "send_failed"}, status=502)
+
+    logger.info("send-debt-reminder → user %s (cp=%s)", telegram_id, counterparty_id)
+    return web.json_response({"ok": True, "telegram_id": telegram_id})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
