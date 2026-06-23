@@ -69,11 +69,17 @@ async def build_report_text(lang: str = "ru") -> str:
         return_exceptions=True,
     )
 
-    def _ok(r) -> tuple[int, float]:
+    # «н/д» = запрос к МойСклад по этому типу документа не прошёл (часто 403:
+    # у API-токена нет прав на раздел). Показываем маркер вместо фейкового 0,
+    # чтобы «приёмка была, а в отчёте 0» больше не вводило в заблуждение.
+    NA = "н/д"
+
+    def _disp(r) -> tuple[str, str]:
         if isinstance(r, Exception):
             logger.error("daily_report aggregate piece failed: %s", r)
-            return 0, 0.0
-        return r
+            return NA, NA
+        count, total = r
+        return str(count), _fmt_money_ru(total)
 
     def _ok_int(r) -> int:
         if isinstance(r, Exception):
@@ -81,26 +87,26 @@ async def build_report_text(lang: str = "ru") -> str:
             return 0
         return int(r)
 
-    orders = _ok(results[0])
-    ship = _ok(results[1])
-    paymin = _ok(results[2])
-    cashin = _ok(results[3])
-    paymout = _ok(results[4])
-    cashout = _ok(results[5])
-    supply = _ok(results[6])
+    orders_count, orders_total = _disp(results[0])
+    ship_count, ship_total = _disp(results[1])
+    paymin_count, paymin_total = _disp(results[2])
+    cashin_count, cashin_total = _disp(results[3])
+    paymout_count, paymout_total = _disp(results[4])
+    cashout_count, cashout_total = _disp(results[5])
+    supply_count, supply_total = _disp(results[6])
     new_cp_ms = _ok_int(results[7])
     new_cp_bot = _ok_int(results[8])
 
     return t(
         "daily_admin_report", lang,
         date=date_label,
-        orders_count=orders[0], orders_total=_fmt_money_ru(orders[1]),
-        ship_count=ship[0], ship_total=_fmt_money_ru(ship[1]),
-        paymentin_count=paymin[0], paymentin_total=_fmt_money_ru(paymin[1]),
-        cashin_count=cashin[0], cashin_total=_fmt_money_ru(cashin[1]),
-        paymentout_count=paymout[0], paymentout_total=_fmt_money_ru(paymout[1]),
-        cashout_count=cashout[0], cashout_total=_fmt_money_ru(cashout[1]),
-        supply_count=supply[0], supply_total=_fmt_money_ru(supply[1]),
+        orders_count=orders_count, orders_total=orders_total,
+        ship_count=ship_count, ship_total=ship_total,
+        paymentin_count=paymin_count, paymentin_total=paymin_total,
+        cashin_count=cashin_count, cashin_total=cashin_total,
+        paymentout_count=paymout_count, paymentout_total=paymout_total,
+        cashout_count=cashout_count, cashout_total=cashout_total,
+        supply_count=supply_count, supply_total=supply_total,
         new_cp_ms=new_cp_ms,
         new_cp_bot=new_cp_bot,
     )
