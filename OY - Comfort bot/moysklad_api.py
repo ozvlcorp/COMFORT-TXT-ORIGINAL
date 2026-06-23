@@ -975,7 +975,17 @@ async def aggregate_documents(
         try:
             data = await _get(url, params=params)
         except Exception as e:
-            logger.error("aggregate_documents %s failed: %s", entity_type, e)
+            logger.error(
+                "aggregate_documents %s failed at offset=%d: %s",
+                entity_type, offset, e,
+            )
+            if offset == 0:
+                # Запрос вообще не прошёл (частый случай — 403: у API-токена нет
+                # прав на раздел, напр. «Закупки/Приёмки» для supply). Раньше это
+                # молча возвращало (0, 0.0), и в отчёте приёмка выглядела как
+                # «0 шт.» — будто её не было. Пробрасываем, чтобы отчёт показал
+                # «н/д» вместо фейкового нуля и операционная проблема была видна.
+                raise
             break
         rows = data.get("rows") or []
         if offset == 0:
