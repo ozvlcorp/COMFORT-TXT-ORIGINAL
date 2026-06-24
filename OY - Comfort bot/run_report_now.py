@@ -34,8 +34,17 @@ async def main(send: bool) -> None:
                 default=DefaultBotProperties(parse_mode=ParseMode.HTML),
             )
             try:
-                await dr.run_for_today(bot)
-                print(f"\n[отправлено в Telegram админам: {ADMIN_IDS}]")
+                # Шлём уже собранный text напрямую (без повторной сборки) и
+                # честно считаем доставку — run_for_today глушит ошибки внутри,
+                # из-за чего раньше печаталось «отправлено» даже при сбое.
+                ok = 0
+                for admin_id in ADMIN_IDS:
+                    try:
+                        await bot.send_message(admin_id, text)
+                        ok += 1
+                    except Exception as e:  # noqa: BLE001
+                        print(f"\n[НЕ доставлено {admin_id}: {repr(e)[:80]}]")
+                print(f"\n[Telegram: доставлено {ok} из {len(ADMIN_IDS)} админам]")
             finally:
                 await bot.session.close()
     finally:
