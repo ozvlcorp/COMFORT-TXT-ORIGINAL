@@ -3,13 +3,262 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
+import time
+from collections import deque
+
 import httpx
-from config import MOYSKLAD_API, MOYSKLAD_ENRICH_CONCURRENCY, MOYSKLAD_TOKEN, MS_MOMENT_LOG
+from config import (
+    MOYSKLAD_API,
+    MOYSKLAD_ENRICH_CONCURRENCY,
+    MOYSKLAD_TOKEN,
+    MS_MOMENT_LOG,
+    MOYSKLAD_MAX_PARALLEL,
+    MOYSKLAD_RATE_LIMIT_MAX_TOKENS,
+    MOYSKLAD_RATE_LIMIT_WINDOW_SEC,
+    MOYSKLAD_MAX_RETRIES,
+    MOYSKLAD_MAX_RATE_LIMIT_WAITS,
+    MOYSKLAD_RETRY_BACKOFF_BASE,
+    MOYSKLAD_RETRY_BACKOFF_MAX,
+    BALANCE_CACHE_TTL_SECONDS,
+    BALANCE_CACHE_MAX_SIZE,
+    COUNTERPARTY_ID_CACHE_TTL_SECONDS,
+    COUNTERPARTY_ID_CACHE_MAX_SIZE,
+)
+from moysklad_cache import TTLCache
 
 logger = logging.getLogger(__name__)
 
 _http_lock: asyncio.Lock | None = None
 _http_client: httpx.AsyncClient | None = None
+
+# ─── Rate limit enforcement (FIX #1) ─────────────────────────────────────────
+# Concurrency semaphore: blocks if MOYSKLAD_MAX_PARALLEL requests are in-flight
+_concurrency_sem: asyncio.Semaphore | None = None
+# Token bucket state: deque of request timestamps (monotonic) in sliding window
+_token_bucket_deque: deque[float] | None = None
+# Lock to protect token bucket mutations (asyncio-safe)
+_token_bucket_lock: asyncio.Lock | None = None
+
+# ─── Caches (FIX #3) ─────────────────────────────────────────────────────────
+balance_cache: TTLCache | None = None
+cp_id_phone_cache: TTLCache | None = None
+
+
+async def init_caches() -> None:
+    """Initialize cache instances (call from bot.py startup)."""
+    global balance_cache, cp_id_phone_cache
+    balance_cache = TTLCache(
+        ttl_seconds=BALANCE_CACHE_TTL_SECONDS,
+        max_size=BALANCE_CACHE_MAX_SIZE,
+    )
+    cp_id_phone_cache = TTLCache(
+        ttl_seconds=COUNTERPARTY_ID_CACHE_TTL_SECONDS,
+        max_size=COUNTERPARTY_ID_CACHE_MAX_SIZE,
+    )
+    # Eagerly build the rate limiters at startup so the first concurrent burst
+    # of requests can't race two of them into existence.
+    await _get_or_init_rate_limiters()
+    logger.info(
+        "Caches initialized: balance (TTL=%ds, max=%d), cp_id_phone (TTL=%ds, max=%d)",
+        BALANCE_CACHE_TTL_SECONDS,
+        BALANCE_CACHE_MAX_SIZE,
+        COUNTERPARTY_ID_CACHE_TTL_SECONDS,
+        COUNTERPARTY_ID_CACHE_MAX_SIZE,
+    )
+
+
+async def close_caches() -> None:
+    """Cleanup caches (no resources held, but good for consistency)."""
+    global balance_cache, cp_id_phone_cache
+    balance_cache = None
+    cp_id_phone_cache = None
+
+
+async def _get_or_init_rate_limiters():
+    """Lazily initialize (once per module lifetime) the global rate limiters.
+
+    Returns: (concurrency_semaphore, token_bucket_deque, token_bucket_lock)
+    """
+    global _concurrency_sem, _token_bucket_deque, _token_bucket_lock
+    if _concurrency_sem is None:
+        _concurrency_sem = asyncio.Semaphore(MOYSKLAD_MAX_PARALLEL)
+        _token_bucket_deque = deque()
+        _token_bucket_lock = asyncio.Lock()
+    return _concurrency_sem, _token_bucket_deque, _token_bucket_lock
+
+
+async def _acquire_token() -> None:
+    """Wait until a token is available in the sliding-window bucket (~45/3s)."""
+    sem, bucket, lock = await _get_or_init_rate_limiters()
+
+    max_toks = MOYSKLAD_RATE_LIMIT_MAX_TOKENS
+
+    while True:
+        async with lock:
+            now = time.monotonic()
+            window_start = now - MOYSKLAD_RATE_LIMIT_WINDOW_SEC
+            # Purge expired timestamps
+            while bucket and bucket[0] < window_start:
+                bucket.popleft()
+            # Check if token available
+            if len(bucket) < max_toks:
+                bucket.append(time.monotonic())
+                return
+        # Wait and retry (avoid tight busy-loop)
+        await asyncio.sleep(0.01)
+
+
+def _is_idempotent_safe(method: str, url: str) -> bool:
+    """True if a request is safe to retry on transient errors.
+
+    Safe: GET (always); POST to /report/* (read-only reports).
+    NOT safe: entity-creation POSTs (duplicate risk), PUT, DELETE.
+    """
+    method_upper = (method or "").upper()
+    if method_upper == "GET":
+        return True
+    if method_upper == "POST" and "/report/" in (url or ""):
+        return True
+    return False
+
+
+async def _request(
+    method: str,
+    url: str,
+    *,
+    json_data: dict | None = None,
+    params: dict | None = None,
+    retry_safe: bool | None = None,
+) -> dict:
+    """Execute an HTTP request with rate-limit and retry protection.
+
+    - Token bucket (45/3s) + concurrency semaphore (5 parallel) gate every call.
+    - 429 → read X-Lognex-Retry-After (ms), release semaphore during sleep, retry
+      without incrementing attempt count.
+    - 5xx / timeout / transport errors → retry with exponential backoff + jitter
+      ONLY if retry_safe; otherwise re-raise immediately.
+    - 4xx (except 429) → re-raise immediately.
+    """
+    sem, bucket, lock = await _get_or_init_rate_limiters()
+
+    if retry_safe is None:
+        retry_safe = _is_idempotent_safe(method, url)
+
+    attempt = 0
+    rate_limit_waits = 0
+    last_exception: Exception | None = None
+
+    while attempt < MOYSKLAD_MAX_RETRIES:
+        attempt += 1
+        try:
+            # Step 1: acquire token (rate limit)
+            await _acquire_token()
+
+            # Step 2: acquire semaphore (concurrency limit)
+            async with sem:
+                client = await _shared_http()
+                m = method.upper()
+                if m == "GET":
+                    resp = await client.get(url, params=params)
+                elif m == "POST":
+                    resp = await client.post(url, json=json_data)
+                elif m == "PUT":
+                    resp = await client.put(url, json=json_data)
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {method}")
+
+                # Step 4: handle 429 rate limit
+                if resp.status_code == 429:
+                    retry_after_ms = None
+                    try:
+                        header_val = resp.headers.get("X-Lognex-Retry-After", "")
+                        if header_val:
+                            retry_after_ms = int(header_val)
+                    except (ValueError, TypeError):
+                        retry_after_ms = None
+                    if retry_after_ms is None:
+                        backoff = MOYSKLAD_RETRY_BACKOFF_BASE * (2 ** rate_limit_waits)
+                        retry_after_ms = int(backoff * 1000)
+                    # Cap the wait — even a server-supplied X-Lognex-Retry-After is
+                    # bounded so a misbehaving header can never hang the request.
+                    wait_sec = min(retry_after_ms / 1000.0, MOYSKLAD_RETRY_BACKOFF_MAX)
+                    # Semaphore released by exiting `async with sem` before sleeping
+                    # so we don't block other requests while waiting.
+                    _429_wait = wait_sec
+                else:
+                    _429_wait = None
+
+                    # Step 5: raise for other HTTP errors
+                    resp.raise_for_status()
+
+                    # Step 6: success
+                    return resp.json()
+
+            # 429 path: semaphore released above. A 429 is flow-control, not a
+            # transient error, so it does not consume the transient-retry budget
+            # (attempt -= 1). Termination is guaranteed by a SEPARATE bounded
+            # counter so a persistently-throttled account can't spin forever.
+            if _429_wait is not None:
+                rate_limit_waits += 1
+                if rate_limit_waits > MOYSKLAD_MAX_RATE_LIMIT_WAITS:
+                    logger.error(
+                        "_request giving up after %d rate-limit (429) waits: url=%s",
+                        rate_limit_waits - 1, url,
+                    )
+                    resp.raise_for_status()  # raises HTTPStatusError for 429
+                logger.warning(
+                    "_request 429 (wait %d/%d): url=%s, sleeping %.2fs",
+                    rate_limit_waits, MOYSKLAD_MAX_RATE_LIMIT_WAITS, url, _429_wait,
+                )
+                await asyncio.sleep(_429_wait)
+                attempt -= 1
+                continue
+
+        except (httpx.TimeoutException, httpx.TransportError) as net_err:
+            last_exception = net_err
+            if not retry_safe:
+                raise
+            if attempt < MOYSKLAD_MAX_RETRIES:
+                backoff = min(
+                    MOYSKLAD_RETRY_BACKOFF_BASE * (2 ** (attempt - 1)),
+                    MOYSKLAD_RETRY_BACKOFF_MAX,
+                )
+                jitter = backoff * 0.1 * (2 * random.random() - 1)
+                wait_sec = backoff + jitter
+                logger.warning(
+                    "_request transient error (attempt %d/%d): %s, retrying in %.2fs",
+                    attempt, MOYSKLAD_MAX_RETRIES, type(net_err).__name__, wait_sec,
+                )
+                await asyncio.sleep(wait_sec)
+                continue
+            raise
+
+        except httpx.HTTPStatusError as http_err:
+            last_exception = http_err
+            if not (500 <= http_err.response.status_code < 600):
+                raise
+            if not retry_safe:
+                raise
+            if attempt < MOYSKLAD_MAX_RETRIES:
+                backoff = min(
+                    MOYSKLAD_RETRY_BACKOFF_BASE * (2 ** (attempt - 1)),
+                    MOYSKLAD_RETRY_BACKOFF_MAX,
+                )
+                jitter = backoff * 0.1 * (2 * random.random() - 1)
+                wait_sec = backoff + jitter
+                logger.warning(
+                    "_request 5xx (attempt %d/%d): status=%d, url=%s, retrying in %.2fs",
+                    attempt, MOYSKLAD_MAX_RETRIES,
+                    http_err.response.status_code, url, wait_sec,
+                )
+                await asyncio.sleep(wait_sec)
+                continue
+            raise
+
+    if last_exception:
+        raise last_exception
+    raise RuntimeError(f"_request exhausted {MOYSKLAD_MAX_RETRIES} attempts for {url}")
 
 
 def _to_default_amount(sum_minor, rate) -> float:
@@ -67,15 +316,16 @@ async def _shared_http() -> httpx.AsyncClient:
         if _http_client is None or _http_client.is_closed:
             _http_client = httpx.AsyncClient(
                 timeout=httpx.Timeout(25.0, connect=10.0),
-                limits=httpx.Limits(max_keepalive_connections=24, max_connections=48),
+                limits=httpx.Limits(max_keepalive_connections=24, max_connections=6),
                 headers=_headers(),
             )
         return _http_client
 
 
 async def close_moysklad_http() -> None:
-    """bot.py finally: ulanishlarni yopish."""
+    """bot.py finally: ulanishlarni yopish + reset rate limiters."""
     global _http_client, _http_lock
+    global _concurrency_sem, _token_bucket_deque, _token_bucket_lock
     if _http_lock is None:
         return
     async with _http_lock:
@@ -83,26 +333,25 @@ async def close_moysklad_http() -> None:
             await _http_client.aclose()
             _http_client = None
 
+    # Reset rate limiter state (for clean restart)
+    _concurrency_sem = None
+    _token_bucket_deque = None
+    _token_bucket_lock = None
+
 
 async def _get(url: str, params: dict | None = None) -> dict:
-    client = await _shared_http()
-    resp = await client.get(url, params=params)
-    resp.raise_for_status()
-    return resp.json()
+    """GET wrapper — always idempotent-safe."""
+    return await _request("GET", url, params=params, retry_safe=True)
 
 
 async def _post(url: str, json_data: dict | None = None) -> dict:
-    client = await _shared_http()
-    resp = await client.post(url, json=json_data)
-    resp.raise_for_status()
-    return resp.json()
+    """POST wrapper — auto-detects retry safety (/report/* safe, creates not)."""
+    return await _request("POST", url, json_data=json_data)
 
 
 async def _put(url: str, json_data: dict | None = None) -> dict:
-    client = await _shared_http()
-    resp = await client.put(url, json=json_data)
-    resp.raise_for_status()
-    return resp.json()
+    """PUT wrapper — generally NOT retryable (mutations)."""
+    return await _request("PUT", url, json_data=json_data, retry_safe=False)
 
 
 async def sync_counterparty(name: str, phone: str, telegram_id: int) -> dict:
@@ -206,14 +455,24 @@ async def find_counterparty_id_by_phone(phone: str) -> str | None:
     """
     Найти ID контрагента в МойСклад по номеру телефона.
 
-    Использует те же поисковые запросы что и sync_counterparty —
-    гарантированно работает, т.к. sync_counterparty уже находил контрагентов.
+    Использует cp_id_phone_cache (TTL ~1h) для избежания повторных запросов.
+    Нормализованный телефон (только цифры) — ключ кеша.
     """
-    url = f"{MOYSKLAD_API}/entity/counterparty"
     phone_digits = "".join(c for c in phone if c.isdigit())
     if not phone_digits:
         return None
 
+    # Try cache first
+    if cp_id_phone_cache is not None:
+        cached = await cp_id_phone_cache.get(phone_digits)
+        if cached is not None:
+            logger.debug(
+                "find_counterparty_id_by_phone: cache HIT for phone=%s → cp_id=%s",
+                phone_digits, cached,
+            )
+            return cached
+
+    url = f"{MOYSKLAD_API}/entity/counterparty"
     suffix9 = phone_digits[-9:]  # последние 9 цифр для сравнения
 
     # Несколько форматов поиска — от точного к широкому
@@ -223,6 +482,7 @@ async def find_counterparty_id_by_phone(phone: str) -> str | None:
         suffix9,               # 909623393
     ]))
 
+    result_cp_id = None
     for search_term in search_variants:
         try:
             resp = await _get(url, params={"search": search_term, "limit": 50})
@@ -230,17 +490,25 @@ async def find_counterparty_id_by_phone(phone: str) -> str | None:
             for row in rows:
                 row_phone_d = "".join(c for c in (row.get("phone") or "") if c.isdigit())
                 if row_phone_d and row_phone_d.endswith(suffix9):
-                    cp_id = row.get("id")
+                    result_cp_id = row.get("id")
                     logger.info(
                         "find_counterparty_id_by_phone: found '%s' (id=%s) via search '%s'",
-                        row.get("name"), cp_id, search_term,
+                        row.get("name"), result_cp_id, search_term,
                     )
-                    return cp_id
+                    break
+            if result_cp_id:
+                break
         except Exception as e:
             logger.debug("Search '%s' failed: %s", search_term, e)
 
-    logger.warning("find_counterparty_id_by_phone: NOT FOUND for phone=%s", phone)
-    return None
+    # Store positive result in cache (TTL ~1h)
+    if cp_id_phone_cache is not None and result_cp_id is not None:
+        await cp_id_phone_cache.set(phone_digits, result_cp_id)
+
+    if result_cp_id is None:
+        logger.warning("find_counterparty_id_by_phone: NOT FOUND for phone=%s", phone)
+
+    return result_cp_id
 
 
 async def fetch_counterparty_balance(counterparty_id: str) -> float:
@@ -250,8 +518,21 @@ async def fetch_counterparty_balance(counterparty_id: str) -> float:
     POST /report/counterparty  (GET с filter= даёт 412, используем POST)
     rows[0].balance — в копейках (1/100 валюты): -786 → -7.86 USD
 
+    Кеш (balance_cache, TTL ~45s) хранит balance float и обновляется при
+    каждом фетче. invalidate_balance_cache(cp_id) форсирует перефетч.
+
     Raises httpx.HTTPStatusError on API errors so callers can handle them.
     """
+    # Try cache first
+    if balance_cache is not None:
+        cached = await balance_cache.get(counterparty_id)
+        if cached is not None:
+            logger.debug(
+                "fetch_counterparty_balance: cache HIT for cp=%s → %.2f USD",
+                counterparty_id, cached,
+            )
+            return cached
+
     counterparty_href = f"{MOYSKLAD_API}/entity/counterparty/{counterparty_id}"
     url = f"{MOYSKLAD_API}/report/counterparty"
     body = {
@@ -271,13 +552,33 @@ async def fetch_counterparty_balance(counterparty_id: str) -> float:
     rows = data.get("rows", [])
     logger.debug("fetch_counterparty_balance: cp=%s rows_count=%d", counterparty_id, len(rows))
     if not rows:
-        logger.warning("fetch_counterparty_balance: empty rows for cp=%s", counterparty_id)
+        # Empty rows is usually a transient/stale-cp_id quirk, not a real 0 balance.
+        # Do NOT cache it, otherwise we'd pin the displayed balance to 0 for the TTL.
+        logger.warning("fetch_counterparty_balance: empty rows for cp=%s (not cached)", counterparty_id)
         return 0.0
+
     row = rows[0]
     balance_raw = row.get("balance", 0) or 0
     balance = round(balance_raw / 100, 2)
     logger.debug("fetch_counterparty_balance: cp=%s raw=%s → %.2f USD", counterparty_id, balance_raw, balance)
+
+    # Store in cache (only real report rows are cached)
+    if balance_cache is not None:
+        await balance_cache.set(counterparty_id, balance)
+
     return balance
+
+
+async def invalidate_balance_cache(counterparty_id: str) -> None:
+    """
+    Invalidate balance cache for a specific counterparty.
+
+    Called immediately after a balance-changing webhook event
+    (shipment, payment, return) so the next read re-fetches from MoySklad.
+    """
+    if balance_cache is not None:
+        await balance_cache.invalidate(counterparty_id)
+        logger.debug("Balance cache invalidated for cp=%s", counterparty_id)
 
 
 def _agent_filter(counterparty_id: str) -> str:

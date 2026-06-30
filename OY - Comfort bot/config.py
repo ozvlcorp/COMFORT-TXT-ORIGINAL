@@ -52,4 +52,46 @@ ADMIN_IDS: list[int] = (
 DAILY_REPORT_HOUR: int = _bounded_int("DAILY_REPORT_HOUR", 20, 0, 23)
 DAILY_REPORT_MINUTE: int = _bounded_int("DAILY_REPORT_MINUTE", 0, 0, 59)
 
+# ─── MoySklad rate-limit configuration (FIX #1) ──────────────────────────────
+# Concurrency limiter: max simultaneous requests (1–5, default 5)
+MOYSKLAD_MAX_PARALLEL: int = _bounded_int("MOYSKLAD_MAX_PARALLEL", 5, 1, 5)
+
+# Token bucket: ~45 requests per 3 seconds (sliding window)
+MOYSKLAD_RATE_LIMIT_MAX_TOKENS: int = _bounded_int(
+    "MOYSKLAD_RATE_LIMIT_MAX_TOKENS", 45, 10, 200
+)
+MOYSKLAD_RATE_LIMIT_WINDOW_SEC: float = float(
+    os.getenv("MOYSKLAD_RATE_LIMIT_WINDOW_SEC", "3.0")
+)
+
+# Retry configuration
+MOYSKLAD_MAX_RETRIES: int = _bounded_int("MOYSKLAD_MAX_RETRIES", 4, 1, 10)
+MOYSKLAD_RETRY_BACKOFF_BASE: float = float(
+    os.getenv("MOYSKLAD_RETRY_BACKOFF_BASE", "0.5")  # seconds
+)
+# Max backoff cap (e.g., 30 seconds before giving up). Also caps a single
+# server-supplied X-Lognex-Retry-After wait so a bad header can't hang a request.
+MOYSKLAD_RETRY_BACKOFF_MAX: float = float(
+    os.getenv("MOYSKLAD_RETRY_BACKOFF_MAX", "30.0")
+)
+# Max number of 429 (rate-limit) waits before giving up — bounds the retry loop
+# so a persistently-throttled account can never spin forever.
+MOYSKLAD_MAX_RATE_LIMIT_WAITS: int = _bounded_int(
+    "MOYSKLAD_MAX_RATE_LIMIT_WAITS", 6, 1, 20
+)
+
+# ─── Cache configuration (FIX #3) ────────────────────────────────────────────
+BALANCE_CACHE_TTL_SECONDS: int = _bounded_int(
+    "BALANCE_CACHE_TTL_SECONDS", 45, 10, 300
+)
+BALANCE_CACHE_MAX_SIZE: int = _bounded_int(
+    "BALANCE_CACHE_MAX_SIZE", 500, 10, 5000
+)
+COUNTERPARTY_ID_CACHE_TTL_SECONDS: int = _bounded_int(
+    "COUNTERPARTY_ID_CACHE_TTL_SECONDS", 3600, 300, 86400
+)
+COUNTERPARTY_ID_CACHE_MAX_SIZE: int = _bounded_int(
+    "COUNTERPARTY_ID_CACHE_MAX_SIZE", 1000, 10, 10000
+)
+
 MOYSKLAD_API = "https://api.moysklad.ru/api/remap/1.2"

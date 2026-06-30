@@ -26,6 +26,9 @@ async def main() -> None:
     await db.init_db()
     logger.info("Database initialised.")
 
+    # Init MoySklad in-process caches (balance / counterparty-id)
+    await moysklad.init_caches()
+
     # Create bot & dispatcher
     bot = Bot(
         token=BOT_TOKEN,
@@ -62,6 +65,7 @@ async def main() -> None:
         except (asyncio.CancelledError, Exception):
             pass
         await moysklad.close_moysklad_http()
+        await moysklad.close_caches()
         await runner.cleanup()
         await bot.session.close()
 

@@ -77,12 +77,81 @@ async def _dispatch_event(entity_type: str, action: str, href: str) -> None:
         await _process_shipment(href)
     elif entity_type == "salesreturn" and action == "CREATE":
         await _process_salesreturn(href)
+    # Keep the report cache consistent when documents are edited/deleted in MoySklad.
+    elif entity_type == "demand" and action == "UPDATE":
+        await _recache_shipment(href)
+    elif entity_type == "demand" and action == "DELETE":
+        await db.delete_shipment_doc(ms._extract_id(href))
+    elif entity_type == "salesreturn" and action == "UPDATE":
+        await _recache_salesreturn(href)
+    elif entity_type == "salesreturn" and action == "DELETE":
+        await db.delete_return_doc(ms._extract_id(href))
     elif entity_type in ("cashin", "paymentin", "cashout", "paymentout") and action == "CREATE":
         await _process_payment(href, entity_type)
     elif entity_type == "supply" and action == "CREATE":
         await _process_supply(href)
     elif entity_type == "purchasereturn" and action == "CREATE":
         await _process_purchasereturn(href)
+
+
+async def _recache_shipment(href: str) -> None:
+    """Re-fetch an edited demand and refresh the report cache (no notification)."""
+    raw = await ms.fetch_entity(href)
+    shipment = ms.parse_demand(raw)
+    await ms.enrich_demand_from_moysklad(raw, shipment)
+    if not shipment["agent_id"]:
+        return
+    try:
+        await db.save_shipment_doc(
+            moysklad_id=shipment["moysklad_id"],
+            shipment_number=shipment["shipment_number"],
+            moysklad_counterparty_id=shipment["agent_id"],
+            customer_name=shipment["agent_name"],
+            customer_phone=shipment["agent_phone"],
+            total_usd=shipment["total_usd"],
+            total_original=shipment.get("total_original", 0.0),
+            currency=shipment.get("currency", "USD"),
+            balance_before=0.0,
+            balance_after=0.0,
+            status=shipment["status"],
+            moment=shipment["moment"],
+            items=shipment["items"],
+            seller_name=shipment.get("seller_name", ""),
+        )
+        logger.info("Shipment %s re-cached (UPDATE) for cp=%s",
+                    shipment["shipment_number"], shipment["agent_id"])
+    except Exception as e:
+        logger.error("Shipment re-cache failed for %s: %s",
+                     shipment.get("shipment_number"), e)
+
+
+async def _recache_salesreturn(href: str) -> None:
+    """Re-fetch an edited salesreturn and refresh the report cache (no notification)."""
+    raw = await ms.fetch_entity(href)
+    ret = ms.parse_salesreturn(raw)
+    if not ret["agent_id"]:
+        return
+    try:
+        await db.save_return_doc(
+            moysklad_id=ret["moysklad_id"],
+            return_number=ret["return_number"],
+            moysklad_counterparty_id=ret["agent_id"],
+            customer_name=ret["agent_name"],
+            customer_phone=ret["agent_phone"],
+            total_usd=ret["total_usd"],
+            total_original=ret.get("total_original", 0.0),
+            currency=ret.get("currency", "USD"),
+            balance_before=0.0,
+            balance_after=0.0,
+            status=ret["status"],
+            moment=ret["moment"],
+            items=ret["items"],
+        )
+        logger.info("Return %s re-cached (UPDATE) for cp=%s",
+                    ret["return_number"], ret["agent_id"])
+    except Exception as e:
+        logger.error("Return re-cache failed for %s: %s",
+                     ret.get("return_number"), e)
 
 
 async def handle_moysklad_webhook(request: web.Request) -> web.Response:
@@ -220,6 +289,8 @@ async def _process_shipment(href: str) -> None:
 
     balance_after = 0.0
     if shipment["agent_id"]:
+        # Balance-changing event: drop any stale cached balance, then re-fetch.
+        await ms.invalidate_balance_cache(shipment["agent_id"])
         try:
             balance_after = await ms.fetch_counterparty_balance(shipment["agent_id"])
         except Exception as e:
@@ -229,6 +300,31 @@ async def _process_shipment(href: str) -> None:
         await db.save_moysklad_counterparty_id(telegram_id, shipment["agent_id"])
 
     balance_before = balance_after + shipment["total_usd"]
+
+    # FIX #2: persist enriched shipment to report cache (items already enriched).
+    if shipment["agent_id"]:
+        try:
+            await db.save_shipment_doc(
+                moysklad_id=shipment["moysklad_id"],
+                shipment_number=shipment["shipment_number"],
+                moysklad_counterparty_id=shipment["agent_id"],
+                customer_name=shipment["agent_name"],
+                customer_phone=shipment["agent_phone"],
+                total_usd=shipment["total_usd"],
+                total_original=shipment.get("total_original", 0.0),
+                currency=shipment.get("currency", "USD"),
+                balance_before=balance_before,
+                balance_after=balance_after,
+                status=shipment["status"],
+                moment=shipment["moment"],
+                items=shipment["items"],
+                seller_name=shipment.get("seller_name", ""),
+            )
+            logger.info("Shipment %s cached to DB for cp=%s",
+                        shipment["shipment_number"], shipment["agent_id"])
+        except Exception as e:
+            logger.error("Shipment cache save failed for %s: %s",
+                         shipment["shipment_number"], e)
 
     if not telegram_id or not _bot:
         logger.info("Shipment %s saved; no TG user for phone %s",
@@ -295,6 +391,7 @@ async def _process_payment(href: str, payment_type: str) -> None:
 
     balance = 0.0
     if payment["agent_id"]:
+        await ms.invalidate_balance_cache(payment["agent_id"])
         try:
             balance = await ms.fetch_counterparty_balance(payment["agent_id"])
         except Exception as e:
@@ -339,6 +436,7 @@ async def _process_salesreturn(href: str) -> None:
 
     balance_after = 0.0
     if ret["agent_id"]:
+        await ms.invalidate_balance_cache(ret["agent_id"])
         try:
             balance_after = await ms.fetch_counterparty_balance(ret["agent_id"])
         except Exception as e:
@@ -348,6 +446,30 @@ async def _process_salesreturn(href: str) -> None:
         await db.save_moysklad_counterparty_id(telegram_id, ret["agent_id"])
 
     balance_before = balance_after - ret["total_usd"]
+
+    # FIX #2: persist return to report cache.
+    if ret["agent_id"]:
+        try:
+            await db.save_return_doc(
+                moysklad_id=ret["moysklad_id"],
+                return_number=ret["return_number"],
+                moysklad_counterparty_id=ret["agent_id"],
+                customer_name=ret["agent_name"],
+                customer_phone=ret["agent_phone"],
+                total_usd=ret["total_usd"],
+                total_original=ret.get("total_original", 0.0),
+                currency=ret.get("currency", "USD"),
+                balance_before=balance_before,
+                balance_after=balance_after,
+                status=ret["status"],
+                moment=ret["moment"],
+                items=ret["items"],
+            )
+            logger.info("Return %s cached to DB for cp=%s",
+                        ret["return_number"], ret["agent_id"])
+        except Exception as e:
+            logger.error("Return cache save failed for %s: %s",
+                         ret["return_number"], e)
 
     if not telegram_id or not _bot:
         logger.info("Return %s saved; no TG user for phone %s",
@@ -386,6 +508,7 @@ async def _process_supply(href: str) -> None:
 
     balance_after = 0.0
     if supply["agent_id"]:
+        await ms.invalidate_balance_cache(supply["agent_id"])
         try:
             balance_after = await ms.fetch_counterparty_balance(supply["agent_id"])
         except Exception as e:
@@ -432,6 +555,7 @@ async def _process_purchasereturn(href: str) -> None:
 
     balance_after = 0.0
     if ret["agent_id"]:
+        await ms.invalidate_balance_cache(ret["agent_id"])
         try:
             balance_after = await ms.fetch_counterparty_balance(ret["agent_id"])
         except Exception as e:
