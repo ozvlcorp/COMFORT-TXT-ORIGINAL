@@ -76,6 +76,9 @@ MENU_REPORT_TEXTS = {"📊 Hisobot", "📊 Отчёт"}
 MENU_LANG_TEXTS = {"🌐 Til", "🌐 Язык"}
 
 MS_DOCUMENTS_TIMEOUT = 25.0
+# One-time historical backfill may scan many pages; give it more headroom than a
+# normal cache read (which is instant). Still bounded so a handler never hangs.
+BACKFILL_TIMEOUT = 45.0
 
 
 # ── Guard helper ───────────────────────────────────────────────────────────
@@ -486,35 +489,165 @@ async def _send_report(message: Message, state: FSMContext) -> None:
 
     moment_lo = f"{iso_from} 00:00:00"
     moment_hi = f"{iso_to} 23:59:59"
+    # Backfill always extends through TODAY, never just the requested period's end,
+    # so the bookkeeping marker truthfully means "everything from backfill_lo to now
+    # is cached" — no invisible gap between an old period's end and today.
+    today_iso = local_today().isoformat()
+
+    # FIX #2: serve reports from the webhook-fed SQLite cache; backfill missing
+    # history once per counterparty; fall back to live MoySklad if DB path fails.
+    shipments: list[dict] = []
+    returns: list[dict] = []
+    use_live = False
     try:
-        shipments = await asyncio.wait_for(
-            fetch_demands_for_counterparty(
-                cp_id,
-                moment_lo=moment_lo,
-                moment_hi=moment_hi,
-                result_limit=None,
-                max_api_scan=8000,
-            ),
-            timeout=MS_DOCUMENTS_TIMEOUT,
-        )
-        returns = await asyncio.wait_for(
-            fetch_salesreturns_for_counterparty(
-                cp_id,
-                moment_lo=moment_lo,
-                moment_hi=moment_hi,
-                result_limit=None,
-                max_api_scan=8000,
-            ),
-            timeout=MS_DOCUMENTS_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        logger.warning("_send_report: MoySklad timeout user=%s", uid)
-        await message.answer(t("orders_ms_error", lang), reply_markup=nav_kb)
-        return
+        backfilled_from = await db.get_report_backfill_status(cp_id)
+        should_backfill = (backfilled_from is None)
+        if period == "all" and backfilled_from and backfilled_from > "2000-01-01":
+            should_backfill = True
+        elif backfilled_from and iso_from < backfilled_from:
+            should_backfill = True
+
+        if should_backfill:
+            backfill_lo = "2000-01-01" if period == "all" else iso_from
+            logger.info(
+                "_send_report backfill cp=%s period=%s range=[%s, %s]",
+                cp_id, period, backfill_lo, today_iso,
+            )
+            try:
+                backfill_shipments = await asyncio.wait_for(
+                    fetch_demands_for_counterparty(
+                        cp_id,
+                        moment_lo=f"{backfill_lo} 00:00:00",
+                        moment_hi=f"{today_iso} 23:59:59",
+                        result_limit=None,
+                        max_api_scan=8000,
+                    ),
+                    timeout=BACKFILL_TIMEOUT,
+                )
+                backfill_returns = await asyncio.wait_for(
+                    fetch_salesreturns_for_counterparty(
+                        cp_id,
+                        moment_lo=f"{backfill_lo} 00:00:00",
+                        moment_hi=f"{today_iso} 23:59:59",
+                        result_limit=None,
+                        max_api_scan=8000,
+                    ),
+                    timeout=BACKFILL_TIMEOUT,
+                )
+
+                save_failures = 0
+                for ship in backfill_shipments:
+                    try:
+                        await db.save_shipment_doc(
+                            moysklad_id=ship["moysklad_id"],
+                            shipment_number=ship["shipment_number"],
+                            moysklad_counterparty_id=cp_id,
+                            customer_name=ship["agent_name"],
+                            customer_phone=ship["agent_phone"],
+                            total_usd=ship["total_usd"],
+                            total_original=ship.get("total_original", 0.0),
+                            currency=ship.get("currency", "USD"),
+                            balance_before=0.0,
+                            balance_after=0.0,
+                            status=ship["status"],
+                            moment=ship["moment"],
+                            items=ship["items"],
+                            seller_name=ship.get("seller_name", ""),
+                        )
+                    except Exception as e:
+                        save_failures += 1
+                        logger.error("Backfill save shipment %s failed: %s",
+                                     ship.get("moysklad_id"), e)
+
+                for ret in backfill_returns:
+                    try:
+                        await db.save_return_doc(
+                            moysklad_id=ret["moysklad_id"],
+                            return_number=ret["return_number"],
+                            moysklad_counterparty_id=cp_id,
+                            customer_name=ret["agent_name"],
+                            customer_phone=ret["agent_phone"],
+                            total_usd=ret["total_usd"],
+                            total_original=ret.get("total_original", 0.0),
+                            currency=ret.get("currency", "USD"),
+                            balance_before=0.0,
+                            balance_after=0.0,
+                            status=ret["status"],
+                            moment=ret["moment"],
+                            items=ret["items"],
+                        )
+                    except Exception as e:
+                        save_failures += 1
+                        logger.error("Backfill save return %s failed: %s",
+                                     ret.get("moysklad_id"), e)
+
+                # Record the marker ONLY if every document persisted. A partial save
+                # must not be marked "done", or the failed docs would be permanently
+                # dropped from all future cached reports (money undercount).
+                if save_failures == 0:
+                    await db.set_report_backfill_status(cp_id, backfill_lo)
+                    logger.info("Backfill complete for cp=%s: marked from=%s", cp_id, backfill_lo)
+                else:
+                    logger.warning(
+                        "_send_report backfill cp=%s: %d save failure(s); marker NOT set, "
+                        "serving live this time", cp_id, save_failures,
+                    )
+                    use_live = True
+            except asyncio.TimeoutError:
+                logger.warning("_send_report backfill timeout cp=%s period=%s → live", cp_id, period)
+                use_live = True
+            except Exception as e:
+                logger.error("_send_report backfill error cp=%s: %s → live", cp_id, e)
+                use_live = True
+
+        # Read the requested window from the cache (date-only inclusive bounds).
+        if not use_live:
+            try:
+                shipments = await db.get_shipments_by_cp_period(cp_id, iso_from, iso_to)
+                returns = await db.get_returns_by_cp_period(cp_id, iso_from, iso_to)
+                logger.info(
+                    "_send_report read from DB: cp=%s ships=%d rets=%d period=%s",
+                    cp_id, len(shipments), len(returns), period,
+                )
+            except Exception as e:
+                logger.error("_send_report DB read failed cp=%s: %s", cp_id, e)
+                use_live = True
     except Exception as e:
-        logger.exception("_send_report: MoySklad fetch: %s", e)
-        await message.answer(t("orders_ms_error", lang), reply_markup=nav_kb)
-        return
+        logger.error("_send_report cache logic failed: %s", e)
+        use_live = True
+
+    # Live MoySklad fallback only if the DB path errored (never hard-break).
+    if use_live:
+        logger.info("_send_report fallback to live API for cp=%s", cp_id)
+        try:
+            shipments = await asyncio.wait_for(
+                fetch_demands_for_counterparty(
+                    cp_id,
+                    moment_lo=moment_lo,
+                    moment_hi=moment_hi,
+                    result_limit=None,
+                    max_api_scan=8000,
+                ),
+                timeout=MS_DOCUMENTS_TIMEOUT,
+            )
+            returns = await asyncio.wait_for(
+                fetch_salesreturns_for_counterparty(
+                    cp_id,
+                    moment_lo=moment_lo,
+                    moment_hi=moment_hi,
+                    result_limit=None,
+                    max_api_scan=8000,
+                ),
+                timeout=MS_DOCUMENTS_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("_send_report: MoySklad live fallback timeout user=%s", uid)
+            await message.answer(t("orders_ms_error", lang), reply_markup=nav_kb)
+            return
+        except Exception as e:
+            logger.exception("_send_report: MoySklad live fallback error: %s", e)
+            await message.answer(t("orders_ms_error", lang), reply_markup=nav_kb)
+            return
 
     ship_count  = len(shipments)
     ret_count   = len(returns)

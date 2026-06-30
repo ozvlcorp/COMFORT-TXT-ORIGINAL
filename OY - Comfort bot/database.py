@@ -96,6 +96,25 @@ async def init_db() -> None:
             "ALTER TABLE users ADD COLUMN balance_usd REAL DEFAULT 0.0",
             "ALTER TABLE users ADD COLUMN balance_updated_at TIMESTAMP",
             "ALTER TABLE shipments ADD COLUMN seller_name TEXT",
+            # FIX #2: webhook-fed report cache columns + indexes + bookkeeping
+            "ALTER TABLE shipments ADD COLUMN moysklad_counterparty_id TEXT",
+            "ALTER TABLE shipments ADD COLUMN total_original REAL DEFAULT 0.0",
+            "ALTER TABLE shipments ADD COLUMN currency TEXT DEFAULT 'USD'",
+            "ALTER TABLE shipment_items ADD COLUMN uom TEXT",
+            "ALTER TABLE shipment_items ADD COLUMN price_original REAL DEFAULT 0.0",
+            "ALTER TABLE shipment_items ADD COLUMN total_original REAL DEFAULT 0.0",
+            "ALTER TABLE returns ADD COLUMN moysklad_counterparty_id TEXT",
+            "ALTER TABLE returns ADD COLUMN total_original REAL DEFAULT 0.0",
+            "ALTER TABLE returns ADD COLUMN currency TEXT DEFAULT 'USD'",
+            "ALTER TABLE return_items ADD COLUMN uom TEXT",
+            "ALTER TABLE return_items ADD COLUMN price_original REAL DEFAULT 0.0",
+            "ALTER TABLE return_items ADD COLUMN total_original REAL DEFAULT 0.0",
+            "CREATE INDEX IF NOT EXISTS idx_shipments_cp_moment ON shipments(moysklad_counterparty_id, moment DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_returns_cp_moment ON returns(moysklad_counterparty_id, moment DESC)",
+            "CREATE TABLE IF NOT EXISTS report_backfill ("
+            "counterparty_id TEXT PRIMARY KEY, "
+            "backfilled_from TEXT, "
+            "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
         ]:
             try:
                 await db.execute(migration)
@@ -456,6 +475,288 @@ async def get_returns_in_period(telegram_id: int, date_from: str, date_to: str) 
         ) as cur:
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
+
+
+# ── Report cache (FIX #2: webhook-fed, queried by counterparty) ──────────────
+
+async def save_shipment_doc(
+    moysklad_id: str,
+    shipment_number: str,
+    moysklad_counterparty_id: str,
+    customer_name: str,
+    customer_phone: str,
+    total_usd: float,
+    total_original: float,
+    currency: str,
+    balance_before: float,
+    balance_after: float,
+    status: str,
+    moment: str,
+    items: list[dict],
+    seller_name: str = "",
+) -> int:
+    """Upsert a shipment (demand) document + its items into the report cache.
+
+    Stores moysklad_counterparty_id / total_original / currency so reports can
+    be served from SQLite instead of live MoySklad API calls.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """INSERT INTO shipments
+               (moysklad_id, shipment_number, telegram_id, customer_name, customer_phone,
+                total_usd, balance_before, balance_after, status, moment, seller_name,
+                moysklad_counterparty_id, total_original, currency)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(moysklad_id) DO UPDATE SET
+                 status = excluded.status,
+                 seller_name = COALESCE(NULLIF(TRIM(excluded.seller_name), ''), shipments.seller_name),
+                 moysklad_counterparty_id = excluded.moysklad_counterparty_id,
+                 total_usd = excluded.total_usd,
+                 total_original = excluded.total_original,
+                 currency = excluded.currency
+               RETURNING id""",
+            (moysklad_id, shipment_number, None, customer_name,
+             normalize_phone(customer_phone), total_usd, balance_before, balance_after,
+             status, moment, (seller_name or "").strip(),
+             moysklad_counterparty_id, total_original, currency),
+        )
+        row = await cur.fetchone()
+        shipment_id = row[0]
+        await db.execute("DELETE FROM shipment_items WHERE shipment_id = ?", (shipment_id,))
+        for item in items:
+            await db.execute(
+                """INSERT INTO shipment_items
+                   (shipment_id, name, quantity, price, total, uom, price_original, total_original)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    shipment_id,
+                    item.get("name"),
+                    item.get("quantity"),
+                    item.get("price"),
+                    item.get("total"),
+                    item.get("uom"),
+                    item.get("price_original", 0.0),
+                    item.get("total_original", 0.0),
+                ),
+            )
+        await db.commit()
+        return shipment_id
+
+
+async def save_return_doc(
+    moysklad_id: str,
+    return_number: str,
+    moysklad_counterparty_id: str,
+    customer_name: str,
+    customer_phone: str,
+    total_usd: float,
+    total_original: float,
+    currency: str,
+    balance_before: float,
+    balance_after: float,
+    status: str,
+    moment: str,
+    items: list[dict],
+) -> int:
+    """Upsert a salesreturn document + its items into the report cache."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """INSERT INTO returns
+               (moysklad_id, return_number, telegram_id, customer_name, customer_phone,
+                total_usd, balance_before, balance_after, status, moment,
+                moysklad_counterparty_id, total_original, currency)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(moysklad_id) DO UPDATE SET
+                 status = excluded.status,
+                 moysklad_counterparty_id = excluded.moysklad_counterparty_id,
+                 total_usd = excluded.total_usd,
+                 total_original = excluded.total_original,
+                 currency = excluded.currency
+               RETURNING id""",
+            (moysklad_id, return_number, None, customer_name,
+             normalize_phone(customer_phone), total_usd, balance_before, balance_after,
+             status, moment,
+             moysklad_counterparty_id, total_original, currency),
+        )
+        row = await cur.fetchone()
+        return_id = row[0]
+        await db.execute("DELETE FROM return_items WHERE return_id = ?", (return_id,))
+        for item in items:
+            await db.execute(
+                """INSERT INTO return_items
+                   (return_id, name, quantity, price, total, uom, price_original, total_original)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    return_id,
+                    item.get("name"),
+                    item.get("quantity"),
+                    item.get("price"),
+                    item.get("total"),
+                    item.get("uom"),
+                    item.get("price_original", 0.0),
+                    item.get("total_original", 0.0),
+                ),
+            )
+        await db.commit()
+        return return_id
+
+
+def _row_to_doc_items(item_rows: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for r in item_rows:
+        out.append({
+            "name": r.get("name"),
+            "code": "",
+            "quantity": r.get("quantity") or 0,
+            "uom": r.get("uom") or "",
+            "price": r.get("price") or 0.0,
+            "total": r.get("total") or 0.0,
+            "price_original": r.get("price_original") or 0.0,
+            "total_original": r.get("total_original") or 0.0,
+        })
+    return out
+
+
+async def get_shipments_by_cp_period(
+    moysklad_counterparty_id: str,
+    date_lo: str,
+    date_hi: str,
+) -> list[dict]:
+    """Read cached shipments for a counterparty whose date is in [date_lo, date_hi].
+
+    date_lo / date_hi are 'YYYY-MM-DD' (inclusive). We compare on the date part
+    of `moment` (substr 1..10) because stored moments may be 16-char
+    'YYYY-MM-DD HH:MM' (no seconds when sec==0); a raw lexical BETWEEN against a
+    padded '...00:00:00' lower bound would wrongly exclude a midnight document.
+    Returns dicts shaped like parse_demand() output (subset used by reports).
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT * FROM shipments
+               WHERE moysklad_counterparty_id = ?
+                 AND substr(moment, 1, 10) BETWEEN ? AND ?
+               ORDER BY moment DESC""",
+            (moysklad_counterparty_id, date_lo, date_hi),
+        ) as cur:
+            ship_rows = [dict(r) for r in await cur.fetchall()]
+
+        results: list[dict] = []
+        for s in ship_rows:
+            async with db.execute(
+                "SELECT * FROM shipment_items WHERE shipment_id = ?", (s["id"],)
+            ) as icur:
+                item_rows = [dict(r) for r in await icur.fetchall()]
+            results.append({
+                "id": s["id"],
+                "moysklad_id": s.get("moysklad_id"),
+                "shipment_number": s.get("shipment_number"),
+                "moment": s.get("moment"),
+                "status": s.get("status"),
+                "seller_name": s.get("seller_name") or "",
+                "total_usd": s.get("total_usd") or 0.0,
+                "total_original": s.get("total_original") or 0.0,
+                "currency": s.get("currency") or "USD",
+                "items": _row_to_doc_items(item_rows),
+            })
+        return results
+
+
+async def get_returns_by_cp_period(
+    moysklad_counterparty_id: str,
+    date_lo: str,
+    date_hi: str,
+) -> list[dict]:
+    """Read cached salesreturns for a counterparty whose date is in [date_lo, date_hi].
+
+    date_lo / date_hi are 'YYYY-MM-DD' (inclusive); compared on substr(moment,1,10)
+    for the same midnight-boundary reason as get_shipments_by_cp_period.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT * FROM returns
+               WHERE moysklad_counterparty_id = ?
+                 AND substr(moment, 1, 10) BETWEEN ? AND ?
+               ORDER BY moment DESC""",
+            (moysklad_counterparty_id, date_lo, date_hi),
+        ) as cur:
+            ret_rows = [dict(r) for r in await cur.fetchall()]
+
+        results: list[dict] = []
+        for s in ret_rows:
+            async with db.execute(
+                "SELECT * FROM return_items WHERE return_id = ?", (s["id"],)
+            ) as icur:
+                item_rows = [dict(r) for r in await icur.fetchall()]
+            results.append({
+                "id": s["id"],
+                "moysklad_id": s.get("moysklad_id"),
+                "return_number": s.get("return_number"),
+                "moment": s.get("moment"),
+                "status": s.get("status"),
+                "total_usd": s.get("total_usd") or 0.0,
+                "total_original": s.get("total_original") or 0.0,
+                "currency": s.get("currency") or "USD",
+                "items": _row_to_doc_items(item_rows),
+            })
+        return results
+
+
+async def delete_shipment_doc(moysklad_id: str) -> None:
+    """Remove a cached shipment + its items (MoySklad DELETE webhook)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id FROM shipments WHERE moysklad_id = ?", (moysklad_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        if row:
+            await db.execute("DELETE FROM shipment_items WHERE shipment_id = ?", (row[0],))
+            await db.execute("DELETE FROM shipments WHERE id = ?", (row[0],))
+            await db.commit()
+
+
+async def delete_return_doc(moysklad_id: str) -> None:
+    """Remove a cached salesreturn + its items (MoySklad DELETE webhook)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id FROM returns WHERE moysklad_id = ?", (moysklad_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        if row:
+            await db.execute("DELETE FROM return_items WHERE return_id = ?", (row[0],))
+            await db.execute("DELETE FROM returns WHERE id = ?", (row[0],))
+            await db.commit()
+
+
+async def get_report_backfill_status(
+    moysklad_counterparty_id: str,
+) -> str | None:
+    """ISO date string (backfilled_from) if a record exists, else None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT backfilled_from FROM report_backfill WHERE counterparty_id = ?",
+            (moysklad_counterparty_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row and row[0] else None
+
+
+async def set_report_backfill_status(
+    moysklad_counterparty_id: str,
+    backfilled_from: str,
+) -> None:
+    """Insert or update the backfill bookkeeping record for a counterparty."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO report_backfill (counterparty_id, backfilled_from, updated_at)
+               VALUES (?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(counterparty_id) DO UPDATE SET
+                 backfilled_from = excluded.backfilled_from,
+                 updated_at = CURRENT_TIMESTAMP""",
+            (moysklad_counterparty_id, backfilled_from),
+        )
+        await db.commit()
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────

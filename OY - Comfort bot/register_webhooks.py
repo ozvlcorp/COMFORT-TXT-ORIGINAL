@@ -16,6 +16,11 @@ async def setup_webhooks():
         {"action": "CREATE", "entityType": "paymentout"},
         {"action": "CREATE", "entityType": "supply"},
         {"action": "CREATE", "entityType": "purchasereturn"},
+        # UPDATE/DELETE keep the webhook-fed report cache consistent with edits.
+        {"action": "UPDATE", "entityType": "demand"},
+        {"action": "DELETE", "entityType": "demand"},
+        {"action": "UPDATE", "entityType": "salesreturn"},
+        {"action": "DELETE", "entityType": "salesreturn"},
     ]
     
     print(f"Setting up webhooks to point to: {target_url}\n")
