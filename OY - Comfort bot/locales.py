@@ -320,6 +320,68 @@ STRINGS: dict[str, dict[str, str]] = {
         ),
     },
 
+    # ── Отчёт по дебиторке (P&L под продажи в долг) ────────────────────────
+    "btn_debt_report": {
+        "uz": "📉 Qarzdorlik",
+        "ru": "📉 Дебиторка",
+    },
+    "debt_report_empty": {
+        "uz": "✅ Ochiq qarzdorlik topilmadi — barcha otgruzkalar to‘langan.",
+        "ru": "✅ Открытой дебиторки нет — все отгрузки оплачены.",
+    },
+    "debt_report_error": {
+        "uz": "⚠️ Qarzdorlik hisobotini olishда xatolik. Keyinroq urinib ko‘ring.",
+        "ru": "⚠️ Не удалось собрать отчёт по дебиторке. Попробуйте позже.",
+    },
+    "debt_report_header": {
+        "ru": (
+            "📉 <b>Дебиторка (продажи в долг)</b>\n"
+            "🗓 на {date}  •  окно {lookback} дн.\n\n"
+            "🧾 Начислено (Σ отгрузок): <b>${accrued}</b>\n"
+            "💵 Собрано (Σ оплат): <b>${collected}</b>\n"
+            "🔴 Дебиторка (остаток): <b>${receivable}</b>\n"
+            "📄 Открытых документов: {doc_count} • должников: {debtor_count}\n\n"
+            "📊 <b>По срокам просрочки:</b>\n"
+            "  🟢 Текущая: {b_current_count} — ${b_current_total}\n"
+            "  🟡 1–7 дн.: {b_d1_7_count} — ${b_d1_7_total}\n"
+            "  🟠 8–30 дн.: {b_d8_30_count} — ${b_d8_30_total}\n"
+            "  🔴 31–90 дн.: {b_d31_90_count} — ${b_d31_90_total}\n"
+            "  ⚫️ 90+ дн. (риск): {b_d90_plus_count} — ${b_d90_plus_total}"
+        ),
+        "uz": (
+            "📉 <b>Qarzdorlik (nasiyaga sotuv)</b>\n"
+            "🗓 {date} holatiga  •  oyna {lookback} kun\n\n"
+            "🧾 Hisoblangan (Σ otgruzka): <b>${accrued}</b>\n"
+            "💵 Yig‘ilgan (Σ to‘lov): <b>${collected}</b>\n"
+            "🔴 Qarzdorlik (qoldiq): <b>${receivable}</b>\n"
+            "📄 Ochiq hujjatlar: {doc_count} • qarzdorlar: {debtor_count}\n\n"
+            "📊 <b>Muddat bo‘yicha:</b>\n"
+            "  🟢 Joriy: {b_current_count} — ${b_current_total}\n"
+            "  🟡 1–7 kun: {b_d1_7_count} — ${b_d1_7_total}\n"
+            "  🟠 8–30 kun: {b_d8_30_count} — ${b_d8_30_total}\n"
+            "  🔴 31–90 kun: {b_d31_90_count} — ${b_d31_90_total}\n"
+            "  ⚫️ 90+ kun (xavf): {b_d90_plus_count} — ${b_d90_plus_total}"
+        ),
+    },
+    "debt_report_rows_header": {
+        "uz": "\n\n🔎 <b>Eng muddati o‘tgan hujjatlar:</b>",
+        "ru": "\n\n🔎 <b>Самые просроченные документы:</b>",
+    },
+    "debt_report_row": {
+        "ru": (
+            "• <b>{client}</b> — №{doc} от {date}\n"
+            "  остаток <b>${remainder}</b> из ${sum} (оплачено ${paid}) • срок {term} дн. • просрочка {overdue} дн."
+        ),
+        "uz": (
+            "• <b>{client}</b> — №{doc} ({date})\n"
+            "  qoldiq <b>${remainder}</b> / ${sum} (to‘landi ${paid}) • muddat {term} kun • kechikish {overdue} kun"
+        ),
+    },
+    "debt_report_more": {
+        "uz": "…va yana {n} ta hujjat",
+        "ru": "…и ещё {n} документов",
+    },
+
     "return_notification": {
         "uz": (
             "🔄 <b>Qaytarish amalga oshirildi!</b>\n\n"

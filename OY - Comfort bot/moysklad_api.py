@@ -1306,6 +1306,186 @@ async def aggregate_documents(
     return total_count, round(total_default, 2)
 
 
+# ─── Receivables / debt aging (P&L под продажи в долг) ───────────────────────
+# MoySklad не даёт готового отчёта по дебиторке с разбивкой по срокам, но у
+# каждой отгрузки (demand) есть поля `sum` (начислено) и `payedSum` (оплачено).
+# Дебиторка документа = sum − payedSum. Срок оплаты у клиентов разный —
+# берём его из доп. поля отгрузки «Срок оплаты» (в днях), иначе — дефолт.
+
+def _payment_term_attribute_label_keys() -> tuple[str, ...]:
+    """Подписи доп. поля отгрузки, задающего срок оплаты в днях."""
+    return (
+        "срок оплаты",
+        "срок",
+        "отсрочка",
+        "to'lov muddati",
+        "tolov muddati",
+        "to‘lov muddati",
+        "muddat",
+        "payment term",
+        "credit term",
+        "term",
+    )
+
+
+def _demand_term_days(data: dict, default_days: int) -> int:
+    """Срок оплаты (дни) из доп. поля отгрузки; иначе — default_days.
+
+    Значение может быть числом (30) или строкой ('30 дней') — вытаскиваем
+    первое целое. Ноль/отрицательное игнорируем, откатываясь на дефолт.
+    """
+    attrs = data.get("attributes") or []
+    if isinstance(attrs, list):
+        keys = _payment_term_attribute_label_keys()
+        for a in attrs:
+            if not isinstance(a, dict):
+                continue
+            label = (a.get("name") or "").strip().lower()
+            if not label or not any(k in label for k in keys):
+                continue
+            val = a.get("value")
+            if isinstance(val, bool) or val is None:
+                continue
+            try:
+                n = int(float(val))
+            except (TypeError, ValueError):
+                digits = "".join(c for c in str(val) if c.isdigit())
+                n = int(digits) if digits else 0
+            if n > 0:
+                return n
+    return default_days
+
+
+def _aging_bucket(overdue_days: int) -> str:
+    """Зона старения долга по числу дней просрочки (см. отчёт «Дебиторка»)."""
+    if overdue_days <= 0:
+        return "current"
+    if overdue_days <= 7:
+        return "d1_7"
+    if overdue_days <= 30:
+        return "d8_30"
+    if overdue_days <= 90:
+        return "d31_90"
+    return "d90_plus"
+
+
+AGING_BUCKET_KEYS: tuple[str, ...] = ("current", "d1_7", "d8_30", "d31_90", "d90_plus")
+
+
+async def aggregate_receivables(
+    *,
+    moment_from_msk: str,
+    moment_to_msk: str,
+    today_local,
+    default_term_days: int,
+    min_remainder: float = 0.01,
+    max_scan: int = 50000,
+) -> dict:
+    """Собрать дебиторку по отгрузкам (продажам в долг) за интервал.
+
+    Для каждой отгрузки: начислено = sum, оплачено = payedSum (оба в валюте
+    по умолчанию аккаунта через rate.value), остаток = начислено − оплачено.
+    Просрочка = (сегодня − дата отгрузки) − срок оплаты. Документы с остатком
+    ниже `min_remainder` считаются закрытыми и в дебиторку не попадают.
+
+    Возвращает словарь:
+      accrued / collected / receivable — суммы Σsum, ΣpayedSum, Σостаток;
+      buckets — {зона: {count, total}} по AGING_BUCKET_KEYS;
+      rows — список строк по документам, отсортирован по просрочке убыв.;
+      doc_count / debtor_count — число открытых документов и должников.
+    """
+    from datetime import datetime as _dt
+
+    url = f"{MOYSKLAD_API}/entity/demand"
+    flt = f"moment>={moment_from_msk};moment<={moment_to_msk}"
+    page = 1000
+    offset = 0
+
+    buckets: dict[str, dict] = {b: {"count": 0, "total": 0.0} for b in AGING_BUCKET_KEYS}
+    rows_out: list[dict] = []
+    accrued = 0.0
+    collected = 0.0
+    receivable = 0.0
+    debtor_ids: set[str] = set()
+
+    while True:
+        params = {
+            "filter": flt,
+            "limit": page,
+            "offset": offset,
+            "order": "moment,asc",
+            "expand": "agent,attributes,rate.currency",
+        }
+        try:
+            data = await _get(url, params=params)
+        except Exception as e:
+            logger.error("aggregate_receivables demand fetch failed: %s", e)
+            break
+        rows = data.get("rows") or []
+        for r in rows:
+            rate = r.get("rate") or {}
+            sum_def = _to_default_amount(r.get("sum"), rate)
+            paid_def = _to_default_amount(r.get("payedSum"), rate)
+            accrued += sum_def
+            collected += paid_def
+            remainder = round(sum_def - paid_def, 2)
+            if remainder < min_remainder:
+                continue
+            receivable += remainder
+
+            agent = r.get("agent") or {}
+            agent_id = _extract_id((agent.get("meta") or {}).get("href", ""))
+            if agent_id:
+                debtor_ids.add(agent_id)
+
+            term = _demand_term_days(r, default_term_days)
+            moment_raw = r.get("moment") or ""
+            try:
+                doc_date = _dt.strptime(moment_raw[:10], "%Y-%m-%d").date()
+                days_since = (today_local - doc_date).days
+            except (ValueError, TypeError):
+                days_since = 0
+            overdue = days_since - term
+            bkey = _aging_bucket(overdue)
+            buckets[bkey]["count"] += 1
+            buckets[bkey]["total"] += remainder
+
+            rows_out.append({
+                "client": (agent.get("name") or "—"),
+                "agent_id": agent_id,
+                "doc": r.get("name") or "",
+                "date": moment_raw[:10],
+                "sum": sum_def,
+                "paid": paid_def,
+                "remainder": remainder,
+                "term": term,
+                "days_since": days_since,
+                "overdue": max(0, overdue),
+                "currency": _doc_currency_name(rate),
+            })
+        if len(rows) < page:
+            break
+        offset += page
+        if offset >= max_scan:
+            logger.warning("aggregate_receivables hit scan cap %d", max_scan)
+            break
+
+    for b in buckets.values():
+        b["total"] = round(b["total"], 2)
+    # Самые проблемные — сверху: сначала по просрочке, затем по остатку.
+    rows_out.sort(key=lambda x: (x["overdue"], x["remainder"]), reverse=True)
+
+    return {
+        "accrued": round(accrued, 2),
+        "collected": round(collected, 2),
+        "receivable": round(receivable, 2),
+        "buckets": buckets,
+        "rows": rows_out,
+        "doc_count": len(rows_out),
+        "debtor_count": len(debtor_ids),
+    }
+
+
 async def count_new_counterparties(
     *, created_from_msk: str, created_to_msk: str
 ) -> int:
