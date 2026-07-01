@@ -19,6 +19,7 @@ from aiohttp import web
 from aiogram.types import BufferedInputFile
 
 import database as db
+import debt_dashboard
 import moysklad_api as ms
 from config import WEBHOOK_PATH, WEBHOOK_SECRET, WEBHOOK_WORKERS, DB_PATH
 from pdf_generator import generate_shipment_pdf
@@ -36,6 +37,7 @@ def setup(app: web.Application, bot) -> None:
     _bot = bot
     app.router.add_post(WEBHOOK_PATH, handle_moysklad_webhook)
     app.router.add_post("/api/send-debt-reminder", handle_send_debt_reminder)
+    app.router.add_get("/debt-report", handle_debt_dashboard)
     app.cleanup_ctx.append(_webhook_worker_context)
 
 
@@ -256,6 +258,33 @@ async def handle_send_debt_reminder(request: web.Request) -> web.Response:
 
     logger.info("send-debt-reminder → user %s (cp=%s)", telegram_id, counterparty_id)
     return web.json_response({"ok": True, "telegram_id": telegram_id})
+
+
+async def handle_debt_dashboard(request: web.Request) -> web.Response:
+    """Веб-дашборд дебиторки (P&L под продажи в долг).
+
+        GET /debt-report?key=<DEBT_DASHBOARD_TOKEN>
+
+    Отдаёт HTML-снимок дебиторки. Защищён токеном: если DEBT_DASHBOARD_TOKEN
+    не задан — эндпоинт выключен (404), чтобы финансовые данные не были
+    доступны по умолчанию. Токен передаётся как ?key= или заголовок
+    X-Dashboard-Token (удобно для браузера).
+    """
+    token = os.getenv("DEBT_DASHBOARD_TOKEN", "")
+    if not token:
+        return web.Response(status=404, text="not found")
+    provided = request.rel_url.query.get("key") or request.headers.get("X-Dashboard-Token", "")
+    if provided != token:
+        logger.warning("debt-report: invalid token from %s", request.remote)
+        return web.Response(status=403, text="forbidden")
+
+    try:
+        html = await debt_dashboard.build_html()
+    except Exception as exc:
+        logger.exception("debt-report dashboard build failed: %s", exc)
+        return web.Response(status=502, text="report build failed")
+
+    return web.Response(text=html, content_type="text/html", charset="utf-8")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

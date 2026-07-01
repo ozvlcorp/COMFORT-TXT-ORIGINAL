@@ -15,7 +15,7 @@ DEBT_REPORT_LOOKBACK_DAYS назад, берутся только неоплач
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import moysklad_api as ms
@@ -47,17 +47,25 @@ def _scan_bounds_msk() -> tuple[str, str]:
     return start_local.astimezone(_MSK).strftime(fmt), end_local.astimezone(_MSK).strftime(fmt)
 
 
-async def build_report_text(lang: str = "ru") -> str | None:
-    """Собрать текст отчёта по дебиторке. None — если открытой дебиторки нет."""
+async def collect_data() -> tuple[dict, date]:
+    """Собрать снимок дебиторки из MoySklad. Возвращает (data, today_local).
+
+    Единая точка сбора для текстового отчёта (Telegram) и веб-дашборда.
+    """
     msk_from, msk_to = _scan_bounds_msk()
     today = local_today()
-
     data = await ms.aggregate_receivables(
         moment_from_msk=msk_from,
         moment_to_msk=msk_to,
         today_local=today,
         default_term_days=DEBT_DEFAULT_TERM_DAYS,
     )
+    return data, today
+
+
+async def build_report_text(lang: str = "ru") -> str | None:
+    """Собрать текст отчёта по дебиторке. None — если открытой дебиторки нет."""
+    data, today = await collect_data()
 
     if data["doc_count"] == 0:
         return None
