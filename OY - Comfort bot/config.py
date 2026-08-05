@@ -56,9 +56,24 @@ DAILY_REPORT_MINUTE: int = _bounded_int("DAILY_REPORT_MINUTE", 0, 0, 59)
 # Concurrency limiter: max simultaneous requests (1–5, default 5)
 MOYSKLAD_MAX_PARALLEL: int = _bounded_int("MOYSKLAD_MAX_PARALLEL", 5, 1, 5)
 
-# Token bucket: ~45 requests per 3 seconds (sliding window)
-MOYSKLAD_RATE_LIMIT_MAX_TOKENS: int = _bounded_int(
-    "MOYSKLAD_RATE_LIMIT_MAX_TOKENS", 45, 10, 200
+# Token bucket. МойСклад считает лимит НЕ в запросах, а в ЕДИНИЦАХ: за
+# 3-секундное окно выдаётся 45 единиц, а вес одного запроса зависит от способа
+# аутентификации (dev.moysklad.ru → Ограничения → «Лимит запросов за
+# 3-секундный период»).
+#
+# Бот ходит по токену ПОЛЬЗОВАТЕЛЯ, поэтому вес растёт по расписанию МойСклада:
+#   с 12.05.2026 — 2 единицы → 22 запроса / 3 с   ← актуально сейчас
+#   с 01.09.2026 — 3 единицы → 15 запросов / 3 с
+#   с 01.12.2026 — 4 единицы → 11 запросов / 3 с
+# Когда наступит следующая дата, достаточно поднять MOYSKLAD_REQUEST_WEIGHT
+# в переменных окружения — пересборка не нужна.
+MOYSKLAD_RATE_LIMIT_MAX_UNITS: int = _bounded_int(
+    "MOYSKLAD_RATE_LIMIT_MAX_UNITS", 45, 5, 200
+)
+MOYSKLAD_REQUEST_WEIGHT: int = _bounded_int("MOYSKLAD_REQUEST_WEIGHT", 2, 1, 10)
+# Отчёты по остаткам стоят 5 единиц независимо от аутентификации.
+MOYSKLAD_STOCK_REQUEST_WEIGHT: int = _bounded_int(
+    "MOYSKLAD_STOCK_REQUEST_WEIGHT", 5, 1, 20
 )
 MOYSKLAD_RATE_LIMIT_WINDOW_SEC: float = float(
     os.getenv("MOYSKLAD_RATE_LIMIT_WINDOW_SEC", "3.0")
@@ -80,6 +95,19 @@ MOYSKLAD_MAX_RATE_LIMIT_WAITS: int = _bounded_int(
     "MOYSKLAD_MAX_RATE_LIMIT_WAITS", 6, 1, 20
 )
 
+# ─── Защита от повторного бана (API_REMAP_12) ────────────────────────────────
+# МойСклад автоматически отключает доступ к API, если за час набирается минута
+# с 200+ запросами, завершившимися ошибкой. Когда доступ уже отключён, КАЖДЫЙ
+# следующий запрос — гарантированная ошибка 403, то есть продолжая долбиться мы
+# сами продлеваем бан. Поймав подряд несколько 403, глушим исходящие запросы на
+# паузу: ошибки перестают копиться, и восстановление не саботируется.
+MOYSKLAD_FORBIDDEN_TRIP_COUNT: int = _bounded_int(
+    "MOYSKLAD_FORBIDDEN_TRIP_COUNT", 3, 1, 50
+)
+MOYSKLAD_FORBIDDEN_COOLDOWN_SEC: float = float(
+    os.getenv("MOYSKLAD_FORBIDDEN_COOLDOWN_SEC", "300.0")
+)
+
 # ─── Cache configuration (FIX #3) ────────────────────────────────────────────
 BALANCE_CACHE_TTL_SECONDS: int = _bounded_int(
     "BALANCE_CACHE_TTL_SECONDS", 45, 10, 300
@@ -92,6 +120,32 @@ COUNTERPARTY_ID_CACHE_TTL_SECONDS: int = _bounded_int(
 )
 COUNTERPARTY_ID_CACHE_MAX_SIZE: int = _bounded_int(
     "COUNTERPARTY_ID_CACHE_MAX_SIZE", 1000, 10, 10000
+)
+
+# Кеш сотрудников. Отчёт обогащает каждую отгрузку владельцем/продавцом, а
+# сотрудников в компании единицы: в разборе бана 05.08.2026 это дало 804
+# запроса /entity/employee на 807 отгрузок — половину всей нагрузки. ФИО
+# сотрудника практически не меняется, поэтому TTL держим большим.
+EMPLOYEE_CACHE_TTL_SECONDS: int = _bounded_int(
+    "EMPLOYEE_CACHE_TTL_SECONDS", 21600, 60, 604800
+)
+EMPLOYEE_CACHE_MAX_SIZE: int = _bounded_int(
+    "EMPLOYEE_CACHE_MAX_SIZE", 500, 10, 5000
+)
+
+# ─── Anti-flood (защита от спама кнопками) ───────────────────────────────────
+# Минимальный интервал между двумя ПРИНЯТЫМИ действиями одного пользователя.
+# Отсчитывается от момента завершения предыдущего действия. Отброшенные
+# нажатия не доходят до обработчика — значит не тратят запросы к МойСкладу.
+THROTTLE_INTERVAL_SEC: float = float(os.getenv("THROTTLE_INTERVAL_SEC", "1.5"))
+# Не чаще одного предупреждения «слишком быстро» на пользователя за это время,
+# чтобы бот не спамил в ответ на спам.
+THROTTLE_WARN_COOLDOWN_SEC: float = float(
+    os.getenv("THROTTLE_WARN_COOLDOWN_SEC", "10.0")
+)
+# Сколько пользователей держим в памяти троттлера (LRU-вытеснение).
+THROTTLE_MAX_TRACKED_USERS: int = _bounded_int(
+    "THROTTLE_MAX_TRACKED_USERS", 5000, 100, 100000
 )
 
 MOYSKLAD_API = "https://api.moysklad.ru/api/remap/1.2"
