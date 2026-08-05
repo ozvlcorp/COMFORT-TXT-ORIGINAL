@@ -94,4 +94,19 @@ COUNTERPARTY_ID_CACHE_MAX_SIZE: int = _bounded_int(
     "COUNTERPARTY_ID_CACHE_MAX_SIZE", 1000, 10, 10000
 )
 
+# ─── Anti-flood (защита от спама кнопками) ───────────────────────────────────
+# Минимальный интервал между двумя ПРИНЯТЫМИ действиями одного пользователя.
+# Отсчитывается от момента завершения предыдущего действия. Отброшенные
+# нажатия не доходят до обработчика — значит не тратят запросы к МойСкладу.
+THROTTLE_INTERVAL_SEC: float = float(os.getenv("THROTTLE_INTERVAL_SEC", "1.5"))
+# Не чаще одного предупреждения «слишком быстро» на пользователя за это время,
+# чтобы бот не спамил в ответ на спам.
+THROTTLE_WARN_COOLDOWN_SEC: float = float(
+    os.getenv("THROTTLE_WARN_COOLDOWN_SEC", "10.0")
+)
+# Сколько пользователей держим в памяти троттлера (LRU-вытеснение).
+THROTTLE_MAX_TRACKED_USERS: int = _bounded_int(
+    "THROTTLE_MAX_TRACKED_USERS", 5000, 100, 100000
+)
+
 MOYSKLAD_API = "https://api.moysklad.ru/api/remap/1.2"

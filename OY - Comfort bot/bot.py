@@ -14,6 +14,7 @@ import webhook_server
 import scheduler
 from config import BOT_TOKEN, WEBHOOK_PORT
 from handlers import start, menu
+from middlewares.throttling import ThrottlingMiddleware
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,6 +36,9 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher()
+    # Анти-флуд ставим outer-мидлварью на update: отсечка происходит ДО фильтров
+    # и обработчиков, поэтому отброшенные нажатия не делают запросов в МойСклад.
+    dp.update.outer_middleware(ThrottlingMiddleware())
     dp.include_router(start.router)
     dp.include_router(menu.router)
 

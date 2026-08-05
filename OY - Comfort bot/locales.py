@@ -62,6 +62,10 @@ STRINGS: dict[str, dict[str, str]] = {
         "uz": "📭 Otgruzkalar topilmadi.",
         "ru": "📭 Отгрузки не найдены.",
     },
+    "too_fast": {
+        "uz": "⏳ Biroz sekinroq — oldingi so‘rov hali bajarilmoqda.",
+        "ru": "⏳ Помедленнее — предыдущий запрос ещё выполняется.",
+    },
     "no_counterparty_for_list": {
         "uz": "❌ MoySklad da kontragent bog‘lanmagan. /start yoki 💰 Balans orqali telefonni tekshiring.",
         "ru": "❌ Нет привязки к контрагенту в МойСклад. Проверьте телефон через /start или 💰 Баланс.",
