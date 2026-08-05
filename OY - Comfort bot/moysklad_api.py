@@ -14,7 +14,11 @@ from config import (
     MOYSKLAD_TOKEN,
     MS_MOMENT_LOG,
     MOYSKLAD_MAX_PARALLEL,
-    MOYSKLAD_RATE_LIMIT_MAX_TOKENS,
+    MOYSKLAD_RATE_LIMIT_MAX_UNITS,
+    MOYSKLAD_REQUEST_WEIGHT,
+    MOYSKLAD_STOCK_REQUEST_WEIGHT,
+    MOYSKLAD_FORBIDDEN_TRIP_COUNT,
+    MOYSKLAD_FORBIDDEN_COOLDOWN_SEC,
     MOYSKLAD_RATE_LIMIT_WINDOW_SEC,
     MOYSKLAD_MAX_RETRIES,
     MOYSKLAD_MAX_RATE_LIMIT_WAITS,
@@ -88,25 +92,85 @@ async def _get_or_init_rate_limiters():
     return _concurrency_sem, _token_bucket_deque, _token_bucket_lock
 
 
-async def _acquire_token() -> None:
-    """Wait until a token is available in the sliding-window bucket (~45/3s)."""
+def _request_weight(url: str) -> int:
+    """Стоимость запроса в единицах лимита МойСклада.
+
+    Отчёты по остаткам стоят 5 единиц независимо от аутентификации; все
+    остальные эндпоинты — MOYSKLAD_REQUEST_WEIGHT (для токена пользователя
+    это 2 единицы с 12.05.2026, дальше по расписанию МойСклада).
+    """
+    u = url or ""
+    if "/report/stock/all" in u or "/report/stock/bystore" in u:
+        return MOYSKLAD_STOCK_REQUEST_WEIGHT
+    return MOYSKLAD_REQUEST_WEIGHT
+
+
+async def _acquire_token(weight: int = 1) -> None:
+    """Ждёт, пока в скользящем окне освободится `weight` единиц лимита.
+
+    Бюджет считается в ЕДИНИЦАХ, а не в запросах: МойСклад списывает за один
+    HTTP-запрос столько единиц, сколько весит этот запрос. Раньше здесь
+    считались сами запросы (45 за 3 с) — вдвое больше реально разрешённого при
+    весе 2, отчего копились 429, а 200+ ошибок за минуту приводят к
+    автоотключению доступа к API.
+    """
     sem, bucket, lock = await _get_or_init_rate_limiters()
 
-    max_toks = MOYSKLAD_RATE_LIMIT_MAX_TOKENS
+    max_units = MOYSKLAD_RATE_LIMIT_MAX_UNITS
+    # Один запрос не может стоить больше всего окна — иначе ждали бы вечно.
+    weight = max(1, min(int(weight), max_units))
 
     while True:
         async with lock:
             now = time.monotonic()
             window_start = now - MOYSKLAD_RATE_LIMIT_WINDOW_SEC
-            # Purge expired timestamps
-            while bucket and bucket[0] < window_start:
+            # Purge expired entries
+            while bucket and bucket[0][0] < window_start:
                 bucket.popleft()
-            # Check if token available
-            if len(bucket) < max_toks:
-                bucket.append(time.monotonic())
+            used = sum(w for _, w in bucket)
+            if used + weight <= max_units:
+                bucket.append((time.monotonic(), weight))
                 return
         # Wait and retry (avoid tight busy-loop)
         await asyncio.sleep(0.01)
+
+
+class MoySkladAccessDisabled(RuntimeError):
+    """Доступ к API отключён (403) — запросы временно не отправляются."""
+
+
+# Счётчик подряд идущих 403 и момент, до которого исходящие запросы заглушены.
+_forbidden_streak: int = 0
+_forbidden_until: float = 0.0
+
+
+def _note_forbidden(url: str) -> None:
+    """Считает подряд идущие 403 и при переполнении включает паузу."""
+    global _forbidden_streak, _forbidden_until
+    _forbidden_streak += 1
+    if _forbidden_streak >= MOYSKLAD_FORBIDDEN_TRIP_COUNT:
+        _forbidden_until = time.monotonic() + MOYSKLAD_FORBIDDEN_COOLDOWN_SEC
+        logger.error(
+            "MoySklad вернул 403 подряд %d раз — доступ к API, похоже, отключён. "
+            "Пауза %.0f с, чтобы не копить ошибки и не продлевать бан. url=%s",
+            _forbidden_streak, MOYSKLAD_FORBIDDEN_COOLDOWN_SEC, url,
+        )
+
+
+def _note_success() -> None:
+    """Сбрасывает счётчик 403 после любого успешного ответа."""
+    global _forbidden_streak, _forbidden_until
+    if _forbidden_streak:
+        logger.info("MoySklad снова отвечает — счётчик 403 сброшен")
+    _forbidden_streak = 0
+    _forbidden_until = 0.0
+
+
+def _forbidden_pause_remaining() -> float:
+    """Сколько секунд ещё длится пауза после серии 403 (0 — паузы нет)."""
+    if not _forbidden_until:
+        return 0.0
+    return max(0.0, _forbidden_until - time.monotonic())
 
 
 def _is_idempotent_safe(method: str, url: str) -> bool:
@@ -142,8 +206,19 @@ async def _request(
     """
     sem, bucket, lock = await _get_or_init_rate_limiters()
 
+    # Доступ отключён (серия 403) — не отправляем запрос вообще. Каждый вызов
+    # сейчас всё равно вернул бы ошибку, а МойСклад отключает API именно за
+    # накопление ошибок, так что молчание ускоряет восстановление.
+    pause_left = _forbidden_pause_remaining()
+    if pause_left > 0:
+        raise MoySkladAccessDisabled(
+            f"Доступ к API МойСклад отключён (403). Повтор через {pause_left:.0f} с."
+        )
+
     if retry_safe is None:
         retry_safe = _is_idempotent_safe(method, url)
+
+    weight = _request_weight(url)
 
     attempt = 0
     rate_limit_waits = 0
@@ -153,7 +228,7 @@ async def _request(
         attempt += 1
         try:
             # Step 1: acquire token (rate limit)
-            await _acquire_token()
+            await _acquire_token(weight)
 
             # Step 2: acquire semaphore (concurrency limit)
             async with sem:
@@ -189,10 +264,15 @@ async def _request(
                 else:
                     _429_wait = None
 
-                    # Step 5: raise for other HTTP errors
+                    # Step 5: raise for other HTTP errors. 403 = доступ к API
+                    # отключён МойСкладом — считаем серию и уходим в паузу,
+                    # чтобы не копить ошибки, за которые бан и выдан.
+                    if resp.status_code == 403:
+                        _note_forbidden(url)
                     resp.raise_for_status()
 
                     # Step 6: success
+                    _note_success()
                     return resp.json()
 
             # 429 path: semaphore released above. A 429 is flow-control, not a
