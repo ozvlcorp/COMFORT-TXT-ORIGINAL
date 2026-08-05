@@ -28,6 +28,8 @@ from config import (
     BALANCE_CACHE_MAX_SIZE,
     COUNTERPARTY_ID_CACHE_TTL_SECONDS,
     COUNTERPARTY_ID_CACHE_MAX_SIZE,
+    EMPLOYEE_CACHE_TTL_SECONDS,
+    EMPLOYEE_CACHE_MAX_SIZE,
 )
 from moysklad_cache import TTLCache
 
@@ -47,11 +49,12 @@ _token_bucket_lock: asyncio.Lock | None = None
 # ─── Caches (FIX #3) ─────────────────────────────────────────────────────────
 balance_cache: TTLCache | None = None
 cp_id_phone_cache: TTLCache | None = None
+employee_cache: TTLCache | None = None
 
 
 async def init_caches() -> None:
     """Initialize cache instances (call from bot.py startup)."""
-    global balance_cache, cp_id_phone_cache
+    global balance_cache, cp_id_phone_cache, employee_cache
     balance_cache = TTLCache(
         ttl_seconds=BALANCE_CACHE_TTL_SECONDS,
         max_size=BALANCE_CACHE_MAX_SIZE,
@@ -59,6 +62,10 @@ async def init_caches() -> None:
     cp_id_phone_cache = TTLCache(
         ttl_seconds=COUNTERPARTY_ID_CACHE_TTL_SECONDS,
         max_size=COUNTERPARTY_ID_CACHE_MAX_SIZE,
+    )
+    employee_cache = TTLCache(
+        ttl_seconds=EMPLOYEE_CACHE_TTL_SECONDS,
+        max_size=EMPLOYEE_CACHE_MAX_SIZE,
     )
     # Eagerly build the rate limiters at startup so the first concurrent burst
     # of requests can't race two of them into existence.
@@ -74,9 +81,10 @@ async def init_caches() -> None:
 
 async def close_caches() -> None:
     """Cleanup caches (no resources held, but good for consistency)."""
-    global balance_cache, cp_id_phone_cache
+    global balance_cache, cp_id_phone_cache, employee_cache
     balance_cache = None
     cp_id_phone_cache = None
+    employee_cache = None
 
 
 async def _get_or_init_rate_limiters():
@@ -972,6 +980,25 @@ def _demand_seller_name(data: dict, owner_name: str) -> str:
     return (owner_name or "").strip()
 
 
+async def _get_employee_cached(href: str) -> dict:
+    """Сотрудник по href, с кешем.
+
+    Отчёт обогащает КАЖДУЮ отгрузку владельцем/продавцом, а сотрудников в
+    компании единицы — одни и те же href запрашивались снова и снова. В разборе
+    бана 05.08.2026 это дало 804 запроса `/entity/employee/{id}` на 807
+    отгрузок, то есть половину всей нагрузки, из-за которой посыпались 429.
+    Кеш схлопывает их в один запрос на сотрудника.
+    """
+    if employee_cache is not None:
+        cached = await employee_cache.get(href)
+        if cached is not None:
+            return cached
+    emp = await _get(href)
+    if employee_cache is not None and isinstance(emp, dict):
+        await employee_cache.set(href, emp)
+    return emp
+
+
 async def _enrich_seller_from_employee_attributes(raw: dict, shipment: dict) -> None:
     """Если в значении employee только meta — подтянуть ФИО по href (список / PDF)."""
     attrs = raw.get("attributes") or []
@@ -998,7 +1025,7 @@ async def _enrich_seller_from_employee_attributes(raw: dict, shipment: dict) -> 
         if not href:
             continue
         try:
-            emp = await _get(href)
+            emp = await _get_employee_cached(href)
             nm = _person_name(emp)
             if nm:
                 shipment["seller_name"] = nm
@@ -1019,7 +1046,7 @@ async def enrich_demand_from_moysklad(raw: dict, shipment: dict) -> None:
         href = (owner.get("meta") or {}).get("href")
         if href:
             try:
-                emp = await _get(href)
+                emp = await _get_employee_cached(href)
                 oname = _person_name(emp)
                 if oname:
                     shipment["owner_name"] = oname

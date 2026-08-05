@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher
@@ -20,6 +21,40 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+
+
+class RedactSecretsFilter(logging.Filter):
+    """Вырезает секреты из строк лога.
+
+    МойСклад вызывает вебхук с секретом в query-строке, а aiohttp пишет полный
+    URL в access-лог — секрет оказывается в логах открытым текстом, и его видит
+    каждый, у кого есть доступ к панели. Фильтр маскирует его на выходе.
+    """
+
+    _PATTERNS = (
+        re.compile(r"((?:secret|token|apikey|api_key|password)=)[^&\s\"']+", re.IGNORECASE),
+        re.compile(r"((?:Bearer|Basic)\s+)[A-Za-z0-9._\-+/=]+"),
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 — логирование не должно падать
+            return True
+        redacted = message
+        for pattern in self._PATTERNS:
+            redacted = pattern.sub(r"\1[REDACTED]", redacted)
+        if redacted != message:
+            record.msg = redacted
+            record.args = ()
+        return True
+
+
+# Фильтр вешаем на обработчики корневого логгера — так он покрывает и
+# aiohttp.access, и httpx, и наши модули.
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(RedactSecretsFilter())
+
 logger = logging.getLogger(__name__)
 
 async def main() -> None:
