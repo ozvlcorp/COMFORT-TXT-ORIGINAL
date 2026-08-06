@@ -8,9 +8,10 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 
-from config import DAILY_REPORT_HOUR, DAILY_REPORT_MINUTE
+from config import DAILY_REPORT_HOUR, DAILY_REPORT_MINUTE, DEBT_REPORT_ENABLED
 from time_utils import LOCAL_TZ
 import daily_report
+import debt_report
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,11 @@ async def run_daily_report_loop(bot) -> None:
             await daily_report.run_for_today(bot)
         except Exception as e:
             logger.exception("daily_report run failed: %s", e)
+        if DEBT_REPORT_ENABLED:
+            try:
+                await debt_report.run_for_today(bot)
+            except Exception as e:
+                logger.exception("debt_report run failed: %s", e)
         # на случай если отчёт отработал быстрее минуты — подождём,
         # чтобы не уйти на повторный запуск в ту же минуту
         await asyncio.sleep(61)

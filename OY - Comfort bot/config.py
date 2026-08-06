@@ -52,6 +52,20 @@ ADMIN_IDS: list[int] = (
 DAILY_REPORT_HOUR: int = _bounded_int("DAILY_REPORT_HOUR", 20, 0, 23)
 DAILY_REPORT_MINUTE: int = _bounded_int("DAILY_REPORT_MINUTE", 0, 0, 59)
 
+# ─── Отчёт по дебиторке (P&L под продажи в долг) ─────────────────────────────
+# Продажи в долг: у отгрузки есть sum (начислено) и payedSum (оплачено);
+# остаток = дебиторка. Срок оплаты у каждого клиента свой — берём из доп.
+# поля «Срок оплаты» на отгрузке, иначе DEBT_DEFAULT_TERM_DAYS.
+DEBT_REPORT_ENABLED: bool = (
+    os.getenv("DEBT_REPORT_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+)
+# Дефолтный срок оплаты (дни), если у отгрузки нет доп. поля «Срок оплаты».
+DEBT_DEFAULT_TERM_DAYS: int = _bounded_int("DEBT_DEFAULT_TERM_DAYS", 30, 1, 365)
+# Насколько глубоко в прошлое сканировать отгрузки для снимка дебиторки.
+DEBT_REPORT_LOOKBACK_DAYS: int = _bounded_int("DEBT_REPORT_LOOKBACK_DAYS", 365, 30, 3650)
+# Сколько самых просроченных документов показывать в тексте отчёта.
+DEBT_REPORT_TOP_N: int = _bounded_int("DEBT_REPORT_TOP_N", 15, 1, 100)
+
 # ─── MoySklad rate-limit configuration (FIX #1) ──────────────────────────────
 # Concurrency limiter: max simultaneous requests (1–5, default 5)
 MOYSKLAD_MAX_PARALLEL: int = _bounded_int("MOYSKLAD_MAX_PARALLEL", 5, 1, 5)

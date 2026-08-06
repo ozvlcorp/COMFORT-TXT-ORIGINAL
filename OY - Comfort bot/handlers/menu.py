@@ -5,6 +5,7 @@ import asyncio
 from datetime import date, timedelta
 
 from aiogram import F, Router
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
@@ -14,6 +15,8 @@ import logging
 from html import escape
 
 import database as db
+import debt_report
+from config import ADMIN_IDS
 from keyboards import language_kb, main_menu_kb, report_nav_kb, report_period_kb
 from locales import t
 from moysklad_api import (
@@ -765,6 +768,38 @@ def _get_period_bounds(period: str, offset: int) -> tuple[date, date]:
 
     else:  # "all"
         return date(2000, 1, 1), today
+
+
+# ── Debt / receivables report (admin only) ──────────────────────────────────
+
+@router.message(Command("debt"))
+async def handle_debt_report(message: Message, state: FSMContext) -> None:
+    """Снимок дебиторки (продажи в долг) по запросу — только для админов."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.clear()
+
+    user = await db.get_user(message.from_user.id)
+    lang = (user or {}).get("language") or "ru"
+
+    try:
+        text = await asyncio.wait_for(
+            debt_report.build_report_text(lang),
+            timeout=BACKFILL_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("handle_debt_report: timeout for admin %s", message.from_user.id)
+        await message.answer(t("debt_report_error", lang))
+        return
+    except Exception as e:
+        logger.exception("handle_debt_report: build failed: %s", e)
+        await message.answer(t("debt_report_error", lang))
+        return
+
+    if text is None:
+        await message.answer(t("debt_report_empty", lang))
+        return
+    await message.answer(text)
 
 
 # ── Language ───────────────────────────────────────────────────────────────
