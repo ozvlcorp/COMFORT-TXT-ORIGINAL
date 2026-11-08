@@ -20,7 +20,7 @@ from aiogram.types import BufferedInputFile
 
 import database as db
 import moysklad_api as ms
-from config import WEBHOOK_PATH, WEBHOOK_SECRET, WEBHOOK_WORKERS, DB_PATH
+from config import WEBHOOK_PATH, WEBHOOK_SECRET, WEBHOOK_WORKERS, DB_PATH, ADMIN_IDS
 from pdf_generator import generate_shipment_pdf
 from formatting import doc_number_for_template, fmt_datetime_display, fmt_quantity, fmt_usd
 
@@ -29,6 +29,29 @@ logger = logging.getLogger(__name__)
 _bot = None
 _webhook_queue = None
 WEBHOOK_QUEUE_MAXSIZE = 500
+
+
+async def _notify_admins_unmatched(doc_type: str, doc_number: str, phone: str, customer_name: str = "") -> None:
+    """Alerts admins when a MoySklad document's customer has no linked Telegram user.
+
+    The customer-facing notification (and PDF) is silently skipped in that case — the
+    document is still saved to MoySklad/report cache, but the customer never learns
+    about it. Without this alert nobody finds out either, since the only trace was a
+    logger.info() line. Best-effort: never raises, so it can't break the caller.
+    """
+    if not _bot or not ADMIN_IDS:
+        return
+    who = f" ({customer_name})" if customer_name else ""
+    text = (
+        f"⚠️ {doc_type} №{doc_number}: клиент{who} не привязан к Telegram "
+        f"(тел. {phone or '—'}). Уведомление и файл клиенту не отправлены — "
+        f"свяжитесь вручную."
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await _bot.send_message(admin_id, text)
+        except Exception as e:
+            logger.warning("admin unmatched-phone alert to %s failed: %s", admin_id, e)
 
 
 def setup(app: web.Application, bot) -> None:
@@ -329,6 +352,10 @@ async def _process_shipment(href: str) -> None:
     if not telegram_id or not _bot:
         logger.info("Shipment %s saved; no TG user for phone %s",
                     shipment["shipment_number"], shipment["agent_phone"])
+        if not telegram_id and _bot:
+            await _notify_admins_unmatched(
+                "Отгрузка", shipment["shipment_number"], shipment["agent_phone"], shipment["agent_name"]
+            )
         return
 
     from locales import t
@@ -405,6 +432,10 @@ async def _process_payment(href: str, payment_type: str) -> None:
     if not telegram_id or not _bot:
         logger.info("Payment %s; no TG user for phone '%s'",
                     payment["payment_number"], payment["agent_phone"])
+        if not telegram_id and _bot:
+            await _notify_admins_unmatched(
+                "Платёж", payment["payment_number"], payment["agent_phone"], payment["agent_name"]
+            )
         return
 
     from locales import t
@@ -474,6 +505,10 @@ async def _process_salesreturn(href: str) -> None:
     if not telegram_id or not _bot:
         logger.info("Return %s saved; no TG user for phone %s",
                     ret["return_number"], ret["agent_phone"])
+        if not telegram_id and _bot:
+            await _notify_admins_unmatched(
+                "Возврат", ret["return_number"], ret["agent_phone"], ret["agent_name"]
+            )
         return
 
     from locales import t
@@ -520,6 +555,10 @@ async def _process_supply(href: str) -> None:
     if not telegram_id or not _bot:
         logger.info("Supply %s saved; no TG user for phone %s",
                     supply["supply_number"], supply["agent_phone"])
+        if not telegram_id and _bot:
+            await _notify_admins_unmatched(
+                "Приёмка", supply["supply_number"], supply["agent_phone"], supply["agent_name"]
+            )
         return
 
     from locales import t
@@ -567,6 +606,10 @@ async def _process_purchasereturn(href: str) -> None:
     if not telegram_id or not _bot:
         logger.info("Purchasereturn %s saved; no TG user for phone %s",
                     ret["return_number"], ret["agent_phone"])
+        if not telegram_id and _bot:
+            await _notify_admins_unmatched(
+                "Возврат поставщику", ret["return_number"], ret["agent_phone"], ret["agent_name"]
+            )
         return
 
     from locales import t
