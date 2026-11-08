@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -37,6 +38,17 @@ def _bounded_int(name: str, default: int, lo: int, hi: int) -> int:
         return default
 
 
+def _optional_bounded_int(name: str, lo: int, hi: int) -> Optional[int]:
+    """Like _bounded_int, but None when the variable is unset, empty or not a number."""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        return max(lo, min(hi, int(raw)))
+    except ValueError:
+        return None
+
+
 # MoySklad: bir vaqtda nechta enrich (owner/employee) so‘rovi
 MOYSKLAD_ENRICH_CONCURRENCY: int = _bounded_int("MOYSKLAD_ENRICH_CONCURRENCY", 6, 1, 16)
 # Webhook workerlar (VPS kichik bo‘lsa 2–3 qiling)
@@ -62,21 +74,39 @@ MOYSKLAD_MAX_PARALLEL: int = _bounded_int("MOYSKLAD_MAX_PARALLEL", 5, 1, 5)
 # 3-секундный период»).
 #
 # Бот ходит по токену ПОЛЬЗОВАТЕЛЯ, поэтому вес растёт по расписанию МойСклада:
-#   с 12.05.2026 — 2 единицы → 22 запроса / 3 с   ← актуально сейчас
+#   с 12.05.2026 — 2 единицы → 22 запроса / 3 с
 #   с 01.09.2026 — 3 единицы → 15 запросов / 3 с
 #   с 01.12.2026 — 4 единицы → 11 запросов / 3 с
-# Когда наступит следующая дата, достаточно поднять MOYSKLAD_REQUEST_WEIGHT
-# в переменных окружения — пересборка не нужна.
+# Вес берётся из расписания по текущей дате (moysklad_api._request_weight),
+# так что в дни перехода ничего менять не нужно — даже без перезапуска бота.
+# Раньше вес был одним числом (2) и молча устарел 01.09.2026: бот тратил
+# в полтора раза больше разрешённого.
 MOYSKLAD_RATE_LIMIT_MAX_UNITS: int = _bounded_int(
     "MOYSKLAD_RATE_LIMIT_MAX_UNITS", 45, 5, 200
 )
-MOYSKLAD_REQUEST_WEIGHT: int = _bounded_int("MOYSKLAD_REQUEST_WEIGHT", 2, 1, 10)
+_MSK = timezone(timedelta(hours=3))
+# Ступени расписания, от новой к старой; каждая начинается в 00:00 по Москве.
+MOYSKLAD_REQUEST_WEIGHT_SCHEDULE: tuple[tuple[datetime, int], ...] = (
+    (datetime(2026, 12, 1, tzinfo=_MSK), 4),
+    (datetime(2026, 9, 1, tzinfo=_MSK), 3),
+    (datetime(2026, 5, 12, tzinfo=_MSK), 2),
+)
+# Если МойСклад снова поменяет расписание: MOYSKLAD_REQUEST_WEIGHT=<единиц>
+# в окружении заменяет его (нужен передеплой, пересборка — нет). Не задано —
+# работаем по расписанию.
+MOYSKLAD_REQUEST_WEIGHT_OVERRIDE: Optional[int] = _optional_bounded_int(
+    "MOYSKLAD_REQUEST_WEIGHT", 1, 10
+)
 # Отчёты по остаткам стоят 5 единиц независимо от аутентификации.
 MOYSKLAD_STOCK_REQUEST_WEIGHT: int = _bounded_int(
     "MOYSKLAD_STOCK_REQUEST_WEIGHT", 5, 1, 20
 )
+# Сколько секунд запрос занимает бюджет: окно МойСклада (3 с) плюс запас.
+# МойСклад засчитывает запрос, когда тот ПРИШЁЛ, а мы — когда отправили; без
+# запаса сетевой разброс сдвигает два запроса, отправленных ровно через 3 с,
+# в одно окно на стороне МойСклада — и выходит лишний 429.
 MOYSKLAD_RATE_LIMIT_WINDOW_SEC: float = float(
-    os.getenv("MOYSKLAD_RATE_LIMIT_WINDOW_SEC", "3.0")
+    os.getenv("MOYSKLAD_RATE_LIMIT_WINDOW_SEC", "3.2")
 )
 
 # Retry configuration
