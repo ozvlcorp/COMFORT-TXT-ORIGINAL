@@ -49,20 +49,26 @@ cd "$APP_DIR"
 # Определяем публичный IP сервера
 SERVER_IP=$(curl -s --max-time 5 https://api.ipify.org || hostname -I | awk '{print $1}')
 
+# Секрет вебхука генерируется случайным на каждой установке. Раньше здесь был
+# один и тот же захардкоженный секрет — в публичном репозитории он даёт любому
+# возможность слать боту поддельные вебхуки МойСклада.
+WEBHOOK_SECRET=$(openssl rand -hex 32)
+
 cat > "$APP_DIR/.env" <<EOF
-BOT_TOKEN=8770624239:
+# Токены заполните вручную после установки (в кабинетах BotFather и МойСклад).
+BOT_TOKEN=
 MOYSKLAD_TOKEN=
 WEBHOOK_HOST=http://${SERVER_IP}
 WEBHOOK_PATH=/moysklad/webhook
 WEBHOOK_PORT=8080
-WEBHOOK_SECRET=mySecretKey2024comfort
+WEBHOOK_SECRET=${WEBHOOK_SECRET}
 DB_PATH=/data/comfort_bot.db
-ADMIN_IDS=2998023,7712842948
+ADMIN_IDS=
 COMPANY_PHONE=+998958220000
 DOMAIN=${SERVER_IP}
 EOF
 
-ok "Конфиг .env создан (IP: ${SERVER_IP})."
+ok "Конфиг .env создан (IP: ${SERVER_IP}). Заполните BOT_TOKEN, MOYSKLAD_TOKEN и ADMIN_IDS."
 
 # ─── 5. Логотип ──────────────────────────────────────────────────────────────
 mkdir -p "$APP_DIR/assets"
