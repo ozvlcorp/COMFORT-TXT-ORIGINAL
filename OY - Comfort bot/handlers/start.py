@@ -121,3 +121,33 @@ async def handle_phone_text(message: Message, state: FSMContext) -> None:
         t("registered_success", "uz"),
         reply_markup=main_menu_kb("uz"),
     )
+
+
+# Registered after the waiting_phone handlers on purpose: during the bot's own
+# registration those run first; this one only sees contacts outside it.
+@router.message(F.contact)
+async def handle_contact_outside_registration(message: Message, state: FSMContext) -> None:
+    """Контакт вне сценария регистрации.
+
+    Так бывает, когда клиент нажимает «Отправить номер» в магазине (Mini App,
+    WebApp.requestContact): Telegram дублирует контакт сообщением в этот чат.
+    Раньше он доходил до запасного ответа меню, и клиент сразу после регистрации
+    в магазине получал «зарегистрируйтесь». Свой номер ещё не зарегистрированного
+    клиента регистрируем как обычно, в остальных случаях молчим.
+    """
+    contact: Contact = message.contact
+    if not contact or not message.from_user or contact.user_id != message.from_user.id:
+        return
+    if await db.get_user(message.from_user.id):
+        return
+
+    name = message.from_user.full_name or contact.first_name or "Mijoz"
+    phone_norm = db.normalize_phone(contact.phone_number or "")
+    await _register_and_link_counterparty(message.from_user.id, name, phone_norm)
+
+    await state.clear()
+
+    await message.answer(
+        t("registered_success", "uz"),
+        reply_markup=main_menu_kb("uz"),
+    )
