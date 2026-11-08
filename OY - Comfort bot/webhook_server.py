@@ -54,6 +54,32 @@ async def _notify_admins_unmatched(doc_type: str, doc_number: str, phone: str, c
             logger.warning("admin unmatched-phone alert to %s failed: %s", admin_id, e)
 
 
+async def _notify_admins_send_failed(
+    doc_type: str, doc_number: str, phone: str, customer_name: str, telegram_id: int, error: Exception
+) -> None:
+    """Alerts admins when a MATCHED customer's Telegram delivery itself failed.
+
+    Distinct from _notify_admins_unmatched: here get_user_by_phone found the right
+    user, but the send raised anyway — most commonly TelegramForbiddenError because
+    the customer blocked the bot. Without this, the exception is only ever caught by
+    _webhook_worker's catch-all logger, so staff never learn a customer stopped
+    receiving notifications. Best-effort: never raises.
+    """
+    if not _bot or not ADMIN_IDS:
+        return
+    who = f" ({customer_name})" if customer_name else ""
+    text = (
+        f"⚠️ {doc_type} №{doc_number}: клиент{who} найден (tg_id={telegram_id}), "
+        f"но доставить сообщение не удалось — вероятно, заблокировал бота.\n"
+        f"Ошибка: {error}\nСвяжитесь вручную (тел. {phone or '—'})."
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await _bot.send_message(admin_id, text)
+        except Exception as e:
+            logger.warning("admin send-failed alert to %s failed: %s", admin_id, e)
+
+
 def setup(app: web.Application, bot) -> None:
     global _bot
     _bot = bot
@@ -378,7 +404,16 @@ async def _process_shipment(href: str) -> None:
         total=fmt_usd(shipment["total_usd"]),
         balance=fmt_usd(balance_after),
     )
-    await _bot.send_message(telegram_id, text)
+    try:
+        await _bot.send_message(telegram_id, text)
+    except Exception as e:
+        logger.warning("Shipment %s: send to user %s failed: %s",
+                       shipment["shipment_number"], telegram_id, e)
+        await _notify_admins_send_failed(
+            "Отгрузка", shipment["shipment_number"], shipment["agent_phone"],
+            shipment["agent_name"], telegram_id, e
+        )
+        return
     try:
         pdf_bytes = generate_shipment_pdf(
             shipment_number=shipment["shipment_number"],
@@ -452,7 +487,16 @@ async def _process_payment(href: str, payment_type: str) -> None:
         method=escape(method_str),
         balance=fmt_usd(balance),
     )
-    await _bot.send_message(telegram_id, text)
+    try:
+        await _bot.send_message(telegram_id, text)
+    except Exception as e:
+        logger.warning("Payment %s: send to user %s failed: %s",
+                       payment["payment_number"], telegram_id, e)
+        await _notify_admins_send_failed(
+            "Платёж", payment["payment_number"], payment["agent_phone"],
+            payment["agent_name"], telegram_id, e
+        )
+        return
     logger.info("Payment notification (%s) → user %s, payment %s, balance %.2f",
                 payment.get("direction"), telegram_id, payment["payment_number"], balance)
 
@@ -528,7 +572,16 @@ async def _process_salesreturn(href: str) -> None:
         total=fmt_usd(ret["total_usd"]),
         balance=fmt_usd(balance_after),
     )
-    await _bot.send_message(telegram_id, text)
+    try:
+        await _bot.send_message(telegram_id, text)
+    except Exception as e:
+        logger.warning("Return %s: send to user %s failed: %s",
+                       ret["return_number"], telegram_id, e)
+        await _notify_admins_send_failed(
+            "Возврат", ret["return_number"], ret["agent_phone"],
+            ret["agent_name"], telegram_id, e
+        )
+        return
     logger.info("Return notification → user %s, return %s, balance %.2f",
                 telegram_id, ret["return_number"], balance_after)
 
@@ -579,7 +632,16 @@ async def _process_supply(href: str) -> None:
         total=fmt_usd(supply["total_usd"]),
         balance=fmt_usd(balance_after),
     )
-    await _bot.send_message(telegram_id, text)
+    try:
+        await _bot.send_message(telegram_id, text)
+    except Exception as e:
+        logger.warning("Supply %s: send to user %s failed: %s",
+                       supply["supply_number"], telegram_id, e)
+        await _notify_admins_send_failed(
+            "Приёмка", supply["supply_number"], supply["agent_phone"],
+            supply["agent_name"], telegram_id, e
+        )
+        return
     logger.info("Supply notification → user %s, supply %s, balance %.2f",
                 telegram_id, supply["supply_number"], balance_after)
 
@@ -629,7 +691,16 @@ async def _process_purchasereturn(href: str) -> None:
         total=fmt_usd(ret["total_usd"]),
         balance=fmt_usd(balance_after),
     )
-    await _bot.send_message(telegram_id, text)
+    try:
+        await _bot.send_message(telegram_id, text)
+    except Exception as e:
+        logger.warning("Purchasereturn %s: send to user %s failed: %s",
+                       ret["return_number"], telegram_id, e)
+        await _notify_admins_send_failed(
+            "Возврат поставщику", ret["return_number"], ret["agent_phone"],
+            ret["agent_name"], telegram_id, e
+        )
+        return
     logger.info("Purchasereturn notification → user %s, return %s, balance %.2f",
                 telegram_id, ret["return_number"], balance_after)
 
