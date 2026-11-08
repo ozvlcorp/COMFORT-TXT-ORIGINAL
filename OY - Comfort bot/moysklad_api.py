@@ -6,6 +6,7 @@ import logging
 import random
 import time
 from collections import deque
+from datetime import datetime, timezone
 
 import httpx
 from config import (
@@ -15,7 +16,8 @@ from config import (
     MS_MOMENT_LOG,
     MOYSKLAD_MAX_PARALLEL,
     MOYSKLAD_RATE_LIMIT_MAX_UNITS,
-    MOYSKLAD_REQUEST_WEIGHT,
+    MOYSKLAD_REQUEST_WEIGHT_OVERRIDE,
+    MOYSKLAD_REQUEST_WEIGHT_SCHEDULE,
     MOYSKLAD_STOCK_REQUEST_WEIGHT,
     MOYSKLAD_FORBIDDEN_TRIP_COUNT,
     MOYSKLAD_FORBIDDEN_COOLDOWN_SEC,
@@ -100,17 +102,33 @@ async def _get_or_init_rate_limiters():
     return _concurrency_sem, _token_bucket_deque, _token_bucket_lock
 
 
+def _current_request_weight(now: datetime | None = None) -> int:
+    """Вес обычного запроса по токену пользователя на момент `now` (по умолчанию — сейчас).
+
+    Берётся из MOYSKLAD_REQUEST_WEIGHT_SCHEDULE, поэтому очередная ступень
+    (01.12.2026 — 4 единицы) включается сама, без перезапуска.
+    MOYSKLAD_REQUEST_WEIGHT в окружении, если задан, заменяет расписание.
+    """
+    if MOYSKLAD_REQUEST_WEIGHT_OVERRIDE is not None:
+        return MOYSKLAD_REQUEST_WEIGHT_OVERRIDE
+    moment = now or datetime.now(timezone.utc)
+    for starts_at, weight in MOYSKLAD_REQUEST_WEIGHT_SCHEDULE:
+        if moment >= starts_at:
+            return weight
+    return 1
+
+
 def _request_weight(url: str) -> int:
     """Стоимость запроса в единицах лимита МойСклада.
 
     Отчёты по остаткам стоят 5 единиц независимо от аутентификации; все
-    остальные эндпоинты — MOYSKLAD_REQUEST_WEIGHT (для токена пользователя
-    это 2 единицы с 12.05.2026, дальше по расписанию МойСклада).
+    остальные эндпоинты — по расписанию МойСклада для токена пользователя
+    (см. _current_request_weight).
     """
     u = url or ""
     if "/report/stock/all" in u or "/report/stock/bystore" in u:
         return MOYSKLAD_STOCK_REQUEST_WEIGHT
-    return MOYSKLAD_REQUEST_WEIGHT
+    return _current_request_weight()
 
 
 async def _acquire_token(weight: int = 1) -> None:
@@ -235,11 +253,12 @@ async def _request(
     while attempt < MOYSKLAD_MAX_RETRIES:
         attempt += 1
         try:
-            # Step 1: acquire token (rate limit)
-            await _acquire_token(weight)
-
-            # Step 2: acquire semaphore (concurrency limit)
+            # Step 1: concurrency slot, step 2: rate-limit units — in this
+            # order, so the units are booked when the request really leaves.
+            # Booked first, they aged while the request queued for a slot, and
+            # MoySklad then saw more in one window than we had counted.
             async with sem:
+                await _acquire_token(weight)
                 client = await _shared_http()
                 m = method.upper()
                 if m == "GET":
