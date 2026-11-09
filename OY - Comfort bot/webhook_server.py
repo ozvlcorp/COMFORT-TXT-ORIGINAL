@@ -20,7 +20,9 @@ from aiogram.types import BufferedInputFile
 
 import database as db
 import moysklad_api as ms
-from config import WEBHOOK_PATH, WEBHOOK_SECRET, WEBHOOK_WORKERS, DB_PATH, ADMIN_IDS
+from config import (
+    WEBHOOK_PATH, WEBHOOK_SECRET, WEBHOOK_WORKERS, DB_PATH, ADMIN_IDS, NOTIFY_UNLINKED_CUSTOMERS,
+)
 from pdf_generator import generate_shipment_pdf
 from formatting import doc_number_for_template, fmt_datetime_display, fmt_quantity, fmt_usd
 
@@ -38,8 +40,11 @@ async def _notify_admins_unmatched(doc_type: str, doc_number: str, phone: str, c
     document is still saved to MoySklad/report cache, but the customer never learns
     about it. Without this alert nobody finds out either, since the only trace was a
     logger.info() line. Best-effort: never raises, so it can't break the caller.
+
+    Off unless NOTIFY_UNLINKED_CUSTOMERS is set: most customers never connect to the
+    bot, so admins got one of these for nearly every payment and shipment.
     """
-    if not _bot or not ADMIN_IDS:
+    if not NOTIFY_UNLINKED_CUSTOMERS or not _bot or not ADMIN_IDS:
         return
     who = f" ({customer_name})" if customer_name else ""
     text = (

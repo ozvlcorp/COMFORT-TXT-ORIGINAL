@@ -59,6 +59,13 @@ ADMIN_IDS: list[int] = (
     if _admin_env
     else []
 )
+# Сообщать админам о каждом платеже/отгрузке клиента, не подключённого к боту
+# («клиент не привязан к Telegram»). По умолчанию выключено: таких клиентов
+# много, и сообщения шли на каждый документ. Включить: NOTIFY_UNLINKED_CUSTOMERS=1.
+# Сообщения о клиентах, которые заблокировали бота, приходят всегда.
+NOTIFY_UNLINKED_CUSTOMERS: bool = (
+    os.getenv("NOTIFY_UNLINKED_CUSTOMERS", "").strip().lower() in ("1", "true", "yes", "on")
+)
 
 # Время дневного отчёта в Asia/Tashkent (DAILY_REPORT_HOUR:DAILY_REPORT_MINUTE)
 DAILY_REPORT_HOUR: int = _bounded_int("DAILY_REPORT_HOUR", 20, 0, 23)
